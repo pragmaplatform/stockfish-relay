@@ -208,6 +208,10 @@ performed by building this project.
 
 ## Verification and licensing
 
+GitHub Actions runs formatting, Clippy, the ordinary test suite, and the real
+Stockfish integration test on every push and pull request. CI uses Ubuntu 24.04,
+Rust 1.98.1, and Ubuntu's packaged Stockfish executable.
+
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
