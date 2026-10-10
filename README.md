@@ -189,7 +189,31 @@ limits still need to match the capacity you want to dedicate to analysis.
 
 ## Container and Render
 
-Build from the repository root:
+GitHub Actions publishes the `linux/amd64` image to
+`ghcr.io/pragmaplatform/stockfish-relay` after all CI checks pass:
+
+- Pushes to the default branch (`main`) publish `latest` and `sha-<full-commit-sha>`.
+- Version tag pushes such as `v1.2.3` publish `1.2.3`. Prerelease tags such as
+  `v1.2.3-rc.1` publish `1.2.3-rc.1`. Version tags do not move `latest`.
+- Pull requests and other branch pushes run checks without publishing.
+
+Publishing uses the workflow's `GITHUB_TOKEN` with `packages: write`; no extra
+registry secret is needed. After the first publish, an organization/package admin
+must open the [package settings](https://github.com/orgs/pragmaplatform/packages/container/stockfish-relay/settings)
+and select **Change visibility → Public**. GHCR packages initially default to
+private even when the source repository is public; see
+[GitHub's package visibility documentation](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-an-organization).
+This is a one-time setup step that enables pulls without authentication.
+
+Pull the published image and give it the local tag used in the examples below:
+
+```bash
+docker pull ghcr.io/pragmaplatform/stockfish-relay:latest
+docker tag ghcr.io/pragmaplatform/stockfish-relay:latest stockfish-relay
+```
+
+For a fixed release, use a version tag such as `:1.2.3`, or pin the image digest.
+Alternatively, build from the repository root:
 
 ```bash
 docker build -t stockfish-relay .
