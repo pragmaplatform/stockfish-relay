@@ -71,6 +71,19 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
+      - name: Read package version
+        id: package
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["version"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"version={version}\n")
+          PY
+
       - name: Image tags and labels
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
@@ -78,6 +91,7 @@ jobs:
           images: ghcr.io/pragmaplatform/stockfish-relay
           flavor: latest=false
           tags: |
+            type=raw,value=${{ steps.package.outputs.version }},priority=900,enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,format=long,enable={{is_default_branch}}
             type=semver,pattern={{version}}

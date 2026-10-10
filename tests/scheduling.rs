@@ -9,6 +9,8 @@ fn config() -> MasterConfig {
         listen: "127.0.0.1:0".parse().unwrap(),
         api_key: "client-key-for-tests".into(),
         worker_key: "worker-key-for-tests".into(),
+        admin_username: None,
+        admin_password: None,
         queue_capacity: 16,
         max_attempts: 3,
         lease_ms: 1000,

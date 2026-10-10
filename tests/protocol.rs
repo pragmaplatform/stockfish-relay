@@ -22,6 +22,32 @@ fn config() -> stockfish_relay::config::MasterConfig {
 }
 
 #[test]
+fn admin_credentials_must_be_complete_valid_and_separate() {
+    let mut config = config();
+    assert!(config.validate().is_ok());
+    config.admin_username = Some("admin".into());
+    assert!(config.validate().is_err());
+    config.admin_password = Some("admin-password-for-tests".into());
+    assert!(config.validate().is_ok());
+    for username in [None, Some(""), Some("user:name"), Some("two words"), Some("user\nname")] {
+        config.admin_username = username.map(str::to_owned);
+        assert!(config.validate().is_err());
+    }
+    config.admin_username = Some("admin".into());
+    for password in [
+        "",
+        "short",
+        "password with spaces",
+        "password-with-newline\n",
+        &config.api_key.clone(),
+        &config.worker_key.clone(),
+    ] {
+        config.admin_password = Some(password.into());
+        assert!(config.validate().is_err());
+    }
+}
+
+#[test]
 fn requests_validate_history_and_search_limits_before_reaching_an_engine() {
     let config = config();
     let request: EvaluateRequest = serde_json::from_value(serde_json::json!({
