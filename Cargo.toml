@@ -1,12 +1,13 @@
 [package]
 name = "stockfish-relay"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "An HTTP Stockfish service with remote workers"
 
 [dependencies]
 axum = "0.8"
+base64 = "0.23"
 clap = { version = "4", features = ["derive", "env"] }
 cozy-chess = "0.3.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }

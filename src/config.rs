@@ -31,6 +31,11 @@ pub struct MasterConfig {
     pub api_key: String,
     #[arg(long, env = "STOCKFISH_RELAY_WORKER_KEY", hide_env_values = true)]
     pub worker_key: String,
+    /// Enable /admin with this HTTP Basic Auth username and --admin-password.
+    #[arg(long, env = "STOCKFISH_RELAY_ADMIN_USERNAME", hide_env_values = true)]
+    pub admin_username: Option<String>,
+    #[arg(long, env = "STOCKFISH_RELAY_ADMIN_PASSWORD", hide_env_values = true)]
+    pub admin_password: Option<String>,
     /// Maximum total queued and executing requests.
     #[arg(long, env = "STOCKFISH_RELAY_QUEUE_CAPACITY", default_value_t = 128)]
     pub queue_capacity: usize,
@@ -62,6 +67,27 @@ impl MasterConfig {
         valid_key(&self.worker_key)?;
         if self.api_key == self.worker_key {
             return Err(Error::Configuration("Client and worker keys must differ".into()));
+        }
+        match (&self.admin_username, &self.admin_password) {
+            (None, None) => {}
+            (Some(username), Some(password)) => {
+                if username.is_empty() || !username.bytes().all(|byte| byte.is_ascii_graphic() && byte != b':') {
+                    return Err(Error::Configuration(
+                        "Admin username must be nonempty printable non-space ASCII without ':'".into(),
+                    ));
+                }
+                valid_key(password)?;
+                if password == &self.api_key || password == &self.worker_key {
+                    return Err(Error::Configuration(
+                        "Admin password must differ from client and worker keys".into(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(Error::Configuration(
+                    "Set both admin username and admin password, or neither to disable /admin".into(),
+                ));
+            }
         }
         if self.queue_capacity == 0
             || self.queue_capacity > 100_000

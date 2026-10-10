@@ -101,6 +101,26 @@ completed/retried/failed counters. `/healthz` checks the master process; `/ready
 requires at least one connected worker. `/openapi.json` serves the generated
 contract, also available with `stockfish-relay openapi > openapi.json`.
 
+## Admin dashboard
+
+Set `STOCKFISH_RELAY_ADMIN_USERNAME` and `STOCKFISH_RELAY_ADMIN_PASSWORD` on the
+master, then open `/admin` on its existing HTTP address. The browser prompts for
+these separate HTTP Basic Auth credentials. Serve it through the same HTTPS
+reverse proxy used for the API when accessing it remotely.
+
+The read-only page reloads every five seconds and shows connected workers,
+engine names, running/available slots, configured threads and hash memory per
+engine, interactive/batch queue sizes, and completed/retried/failed totals.
+Totals reset when the master restarts; disconnected workers disappear. There
+is no historical storage or collection of actual CPU/RAM usage.
+
+The dashboard is disabled (404) when both settings are absent. Setting only one
+is a configuration error. The username must be printable non-space ASCII without
+a colon. The password must contain at least 16 printable non-space ASCII
+characters and differ from the client and worker keys; generate one with
+`openssl rand -hex 32`. Admin credentials only authorize the dashboard.
+On Render, add both variables to the master service's environment to enable it.
+
 ## Retries and scheduling
 
 Workers register their engine identity and capacity, then long-poll for jobs.
@@ -142,6 +162,8 @@ The binary does not automatically load `.env` files.
 | `STOCKFISH_RELAY_MODE` | `master` | Docker; `master` or `worker` (`slave` alias) |
 | `STOCKFISH_RELAY_API_KEY` | Required | Master/client authentication |
 | `STOCKFISH_RELAY_WORKER_KEY` | Required | Master/worker authentication |
+| `STOCKFISH_RELAY_ADMIN_USERNAME` | Unset; dashboard disabled | Master; HTTP Basic Auth username |
+| `STOCKFISH_RELAY_ADMIN_PASSWORD` | Unset; dashboard disabled | Master; separate HTTP Basic Auth password |
 | `STOCKFISH_RELAY_LISTEN` | `127.0.0.1:8080` | Master |
 | `STOCKFISH_RELAY_MASTER_URL` | Required | Worker; scheme, host, optional port |
 | `STOCKFISH_RELAY_WORKER_NAME` | `worker` | Worker display name |
@@ -192,7 +214,10 @@ limits still need to match the capacity you want to dedicate to analysis.
 GitHub Actions publishes the `linux/amd64` image to
 `ghcr.io/pragmaplatform/stockfish-relay` after all CI checks pass:
 
-- Pushes to the default branch (`main`) publish `latest` and `sha-<full-commit-sha>`.
+- Pushes to the default branch (`main`) publish the package version from
+  `Cargo.toml` (currently `0.2.0`), `latest`, and `sha-<full-commit-sha>`.
+  The package-version tag updates on each successful main build until the version
+  changes; use the commit tag or image digest to pin a specific build.
 - Version tag pushes such as `v1.2.3` publish `1.2.3`. Prerelease tags such as
   `v1.2.3-rc.1` publish `1.2.3-rc.1`. Version tags do not move `latest`.
 - Pull requests and other branch pushes run checks without publishing.

@@ -45,6 +45,7 @@ pub fn router(master: Master) -> Router {
         .route("/openapi.json", get(|| async { Json(openapi()) }))
         .merge(clients)
         .merge(workers)
+        .merge(crate::admin::router(&master))
         .layer(DefaultBodyLimit::max(256 * 1024))
         .with_state(master)
 }

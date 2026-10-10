@@ -37,7 +37,10 @@ impl Server {
     }
 
     async fn on(listener: TcpListener, origin: String) -> Self {
-        let config = master_config();
+        Self::with_config(listener, origin, master_config()).await
+    }
+
+    async fn with_config(listener: TcpListener, origin: String, config: MasterConfig) -> Self {
         let stop = CancellationToken::new();
         let shutdown = stop.clone();
         let task = tokio::spawn(async move { master::serve(listener, config, shutdown).await });
@@ -81,6 +84,159 @@ impl Server {
             .unwrap()
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn admin_dashboard_is_disabled_without_credentials() {
+    let server = Server::start().await;
+    for path in ["admin", "admin/"] {
+        let response = server
+            .client
+            .get(format!("{}{path}", server.origin))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(response.headers().get("www-authenticate").is_none());
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_safely() {
+    const PASSWORD: &str = "admin-password:for-tests";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    let mut config = master_config();
+    config.admin_username = Some("admin".into());
+    config.admin_password = Some(PASSWORD.into());
+    config.lease_ms = 60_000;
+    let server = Server::with_config(listener, origin, config).await;
+    for path in ["admin", "admin/"] {
+        let url = format!("{}{path}", server.origin);
+        for request in [
+            server.client.get(&url),
+            server.client.get(&url).basic_auth("admin", Some("wrong")),
+            server.client.get(&url).basic_auth("wrong", Some(PASSWORD)),
+            server.client.get(&url).bearer_auth(API_KEY),
+            server.client.get(&url).bearer_auth(WORKER_KEY),
+            server.client.get(&url).header("Authorization", "Basic !!!"),
+        ] {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers()["www-authenticate"],
+                "Basic realm=\"Stockfish Relay admin\""
+            );
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert!(!response.text().await.unwrap().contains("Relay statistics"));
+        }
+        let response = server
+            .client
+            .get(&url)
+            .basic_auth("admin", Some(PASSWORD))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/html; charset=utf-8");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(
+            response.headers()["content-security-policy"]
+                .to_str()
+                .unwrap()
+                .contains("default-src 'none'")
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains("No workers connected"));
+        assert!(body.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
+        assert!(!body.contains(PASSWORD));
+        assert!(!body.contains(API_KEY));
+        assert!(!body.contains(WORKER_KEY));
+    }
+
+    let registration = RegisterWorker {
+        protocol_version: PROTOCOL_VERSION,
+        name: "<script>alert('worker')</script>".into(),
+        capacity: 3,
+        engine: EngineInfo {
+            name: "Stockfish <19> & \"test\"".into(),
+            threads: 2,
+            hash_mb: 128,
+        },
+    };
+    let session: WorkerSession = server
+        .client
+        .post(format!("{}v1/workers/register", server.origin))
+        .bearer_auth(WORKER_KEY)
+        .json(&registration)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let url = format!("{}admin", server.origin);
+    let body = server
+        .client
+        .get(&url)
+        .basic_auth("admin", Some(PASSWORD))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("&lt;script&gt;alert(&#39;worker&#39;)&lt;/script&gt;"));
+    assert!(body.contains("Stockfish &lt;19&gt; &amp; &quot;test&quot;"));
+    assert!(!body.contains("<script>"));
+    assert!(body.contains(&session.worker_id.to_string()));
+    assert!(body.contains("<td>0 / 3</td><td>2</td><td>128 MB</td>"));
+    assert!(body.contains("Engine slots</h2><p class=\"value\">3</p>"));
+    assert!(!body.contains("No workers connected"));
+
+    // Admin credentials do not grant access to either API role.
+    for request in [
+        server.client.get(format!("{}v1/status", server.origin)),
+        server
+            .client
+            .post(format!("{}v1/workers/register", server.origin))
+            .json(&registration),
+    ] {
+        assert_eq!(
+            request
+                .basic_auth("admin", Some(PASSWORD))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(server.status().await.workers.len(), 1);
+    server
+        .client
+        .delete(format!("{}v1/workers/{}", server.origin, session.worker_id))
+        .bearer_auth(WORKER_KEY)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let body = server
+        .client
+        .get(url)
+        .basic_auth("admin", Some(PASSWORD))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("No workers connected"));
+    server.stop().await;
 }
 
 fn master_config() -> MasterConfig {

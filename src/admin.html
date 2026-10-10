@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="5">
+  <title>Admin · Stockfish Relay</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; background: #f3f5f7; color: #182230; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    main { max-width: 1120px; margin: auto; padding: 40px 24px; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 28px; }
+    h1 { font-size: 28px; letter-spacing: -.7px; margin: 0 0 6px; }
+    h2 { margin: 0; font-size: 18px; }
+    p { margin: 0; }
+    .subtitle, .detail, footer, small { color: #586579; }
+    .refresh { color: #235e51; background: #e3f1eb; padding: 8px 12px; border-radius: 6px; font-size: 13px; white-space: nowrap; }
+    .stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .stat, .workers { background: #fff; border: 1px solid #dce2e9; border-radius: 10px; }
+    .stat { padding: 20px; }
+    .stat h2 { font-size: 13px; font-weight: 600; color: #586579; }
+    .value { font-size: 32px; font-weight: 650; font-variant-numeric: tabular-nums; margin: 8px 0 4px; }
+    .detail { font-size: 12px; }
+    .workers { margin-top: 24px; overflow: hidden; }
+    .workers h2 { padding: 20px; }
+    .empty { padding: 0 20px 24px; color: #586579; line-height: 1.6; }
+    .table-wrap { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; text-align: left; font-size: 14px; }
+    th, td { padding: 16px 20px; border-top: 1px solid #e5e9ef; }
+    thead th { background: #f8f9fb; font-size: 12px; color: #586579; white-space: nowrap; }
+    tbody th { min-width: 230px; overflow-wrap: anywhere; }
+    td { min-width: 125px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    small { display: block; font-size: 10px; font-weight: 400; margin-top: 5px; }
+    footer { font-size: 12px; line-height: 1.6; margin-top: 20px; }
+    @media (max-width: 600px) {
+      main { padding: 24px 16px; }
+      header { flex-direction: column; align-items: flex-start; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .stat { padding: 16px; }
+      h1 { font-size: 25px; }
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { background: #101720; color: #e2e8f0; }
+      .stat, .workers { background: #18222f; border-color: #2b394b; }
+      .subtitle, .detail, footer, small, .stat h2, .empty, thead th { color: #a5b4c8; }
+      thead th { background: #1c2939; }
+      th, td { border-color: #2b394b; }
+      .refresh { color: #a1ddc8; background: #203d36; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div><h1>Stockfish Relay</h1><p class="subtitle">Worker activity and job statistics</p></div>
+      <p class="refresh">Page refreshes every 5 seconds</p>
+    </header>
+    {{content}}
+    <footer>Read-only dashboard. Completed, retried, and failed totals reset when the master restarts.<br>Threads and hash memory are configured per engine, not measured CPU or RAM usage.</footer>
+  </main>
+</body>
+</html>
