@@ -1,0 +1,577 @@
+#![cfg(unix)]
+
+use std::{
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use clap::Parser;
+use reqwest::{Client, StatusCode};
+use stockfish_relay::{
+    config::{Cli, Command, MasterConfig, StockfishConfig, WorkerConfig},
+    engine::Stockfish,
+    error::Error,
+    master,
+    protocol::*,
+    worker,
+};
+use tokio::{net::TcpListener, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
+
+const API_KEY: &str = "client-key-for-tests";
+const WORKER_KEY: &str = "worker-key-for-tests";
+
+struct Server {
+    origin: String,
+    client: Client,
+    stop: CancellationToken,
+    task: JoinHandle<Result<(), Error>>,
+}
+
+impl Server {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}/", listener.local_addr().unwrap());
+        Self::on(listener, origin).await
+    }
+
+    async fn on(listener: TcpListener, origin: String) -> Self {
+        let config = master_config();
+        let stop = CancellationToken::new();
+        let shutdown = stop.clone();
+        let task = tokio::spawn(async move { master::serve(listener, config, shutdown).await });
+        Self {
+            origin,
+            client: Client::builder().timeout(Duration::from_secs(8)).build().unwrap(),
+            stop,
+            task,
+        }
+    }
+
+    async fn status(&self) -> Status {
+        self.client
+            .get(format!("{}v1/status", self.origin))
+            .bearer_auth(API_KEY)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+
+    async fn wait_workers(&self, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.status().await.workers.len() != count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn stop(self) {
+        self.stop.cancel();
+        tokio::time::timeout(Duration::from_secs(3), self.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+}
+
+fn master_config() -> MasterConfig {
+    let Command::Master(mut config) = Cli::parse_from([
+        "stockfish-relay",
+        "master",
+        "--api-key",
+        API_KEY,
+        "--worker-key",
+        WORKER_KEY,
+    ])
+    .command
+    else {
+        unreachable!()
+    };
+    config.lease_ms = 900;
+    config.long_poll_ms = 50;
+    config.search_timeout_ms = 2000;
+    config.request_timeout_ms = 7000;
+    config
+}
+
+fn worker_config(server: &Server, engine: &Path) -> WorkerConfig {
+    WorkerConfig {
+        master: server.origin.parse().unwrap(),
+        worker_key: WORKER_KEY.into(),
+        name: "integration".into(),
+        concurrency: 2,
+        stockfish: StockfishConfig {
+            stockfish_path: engine.into(),
+            threads: 1,
+            hash_mb: 16,
+        },
+    }
+}
+
+fn fixture(dir: &Path, crash_once: bool) -> PathBuf {
+    let path = dir.join("stockfish");
+    let marker = dir.join("crashed");
+    let failure = if crash_once {
+        format!(
+            "if [ ! -f '{}' ]; then touch '{}'; exit 7; fi",
+            marker.display(),
+            marker.display()
+        )
+    } else {
+        String::new()
+    };
+    let script = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        uci) printf '%s\n' 'id name Stockfish fixture' 'uciok' ;;
+        isready) printf '%s\n' 'readyok' ;;
+        go*)
+            {failure}
+            printf '%s\n' 'info depth 10 score cp 25 nodes 1000 pv e2e4 e7e5' 'bestmove e2e4'
+            ;;
+    esac
+done
+"#
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+fn start_worker(server: &Server, engine: &Path) -> (CancellationToken, JoinHandle<Result<(), Error>>) {
+    let stop = CancellationToken::new();
+    let shutdown = stop.clone();
+    let config = worker_config(server, engine);
+    (stop, tokio::spawn(async move { worker::run(config, shutdown).await }))
+}
+
+async fn stop_worker(stop: CancellationToken, worker: JoinHandle<Result<(), Error>>) {
+    stop.cancel();
+    tokio::time::timeout(Duration::from_secs(3), worker)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+async fn evaluate(server: &Server) -> EvaluateResponse {
+    server
+        .client
+        .post(format!("{}v1/evaluate", server.origin))
+        .bearer_auth(API_KEY)
+        .json(&EvaluateRequest::default())
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn http_roles_health_validation_and_missing_capacity() {
+    let server = Server::start().await;
+    assert_eq!(
+        server
+            .client
+            .get(format!("{}healthz", server.origin))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        server
+            .client
+            .get(format!("{}readyz", server.origin))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        server
+            .client
+            .get(format!("{}v1/status", server.origin))
+            .bearer_auth(WORKER_KEY)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        server
+            .client
+            .post(format!("{}v1/workers/register", server.origin))
+            .bearer_auth(API_KEY)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = server
+        .client
+        .post(format!("{}v1/evaluate", server.origin))
+        .bearer_auth(API_KEY)
+        .json(&EvaluateRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let invalid = server
+        .client
+        .post(format!("{}v1/evaluate", server.origin))
+        .bearer_auth(API_KEY)
+        .json(&serde_json::json!({"moves":["e2e5"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn real_http_worker_restarts_a_crashed_engine_and_completes_the_original_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = fixture(dir.path(), true);
+    let server = Server::start().await;
+    let (stop, task) = start_worker(&server, &engine);
+    server.wait_workers(1).await;
+    let response = evaluate(&server).await;
+    assert_eq!(response.attempts, 2);
+    assert_eq!(response.result.best_move.as_deref(), Some("e2e4"));
+    assert_eq!(response.result.engine.hash_mb, 16);
+    assert_eq!(server.status().await.retried, 1);
+    let (a, b, c) = tokio::join!(evaluate(&server), evaluate(&server), evaluate(&server));
+    assert_eq!(a.attempts + b.attempts + c.attempts, 3);
+    stop_worker(stop, task).await;
+    server.wait_workers(0).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_silent_worker_is_replaced_over_http_and_its_late_result_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = fixture(dir.path(), false);
+    let server = Server::start().await;
+    let registration = RegisterWorker {
+        protocol_version: PROTOCOL_VERSION,
+        name: "disconnected".into(),
+        capacity: 1,
+        engine: EngineInfo {
+            name: "Stockfish fixture".into(),
+            threads: 1,
+            hash_mb: 16,
+        },
+    };
+    let disconnected: WorkerSession = server
+        .client
+        .post(format!("{}v1/workers/register", server.origin))
+        .bearer_auth(WORKER_KEY)
+        .json(&registration)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let client = server.client.clone();
+    let origin = server.origin.clone();
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("{origin}v1/evaluate"))
+            .bearer_auth(API_KEY)
+            .json(&EvaluateRequest::default())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<EvaluateResponse>()
+            .await
+            .unwrap()
+    });
+    let abandoned: Assignment = loop {
+        let response = server
+            .client
+            .post(format!("{}v1/workers/{}/claim", server.origin, disconnected.worker_id))
+            .bearer_auth(WORKER_KEY)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        if response.status() == StatusCode::OK {
+            break response.json().await.unwrap();
+        }
+    };
+    let (stop, task) = start_worker(&server, &engine);
+    let response = request.await.unwrap();
+    assert_eq!(response.job_id, abandoned.id.job_id);
+    assert_eq!(response.attempts, 2);
+    let late = server
+        .client
+        .post(format!(
+            "{}v1/workers/{}/complete",
+            server.origin, disconnected.worker_id
+        ))
+        .bearer_auth(WORKER_KEY)
+        .json(&Completion {
+            assignment: abandoned.id,
+            outcome: Outcome::Failed {
+                error: "late failure".into(),
+            },
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(late.status(), StatusCode::CONFLICT);
+    stop_worker(stop, task).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn worker_reconnects_after_master_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = fixture(dir.path(), false);
+    let server = Server::start().await;
+    let address = server
+        .origin
+        .strip_prefix("http://")
+        .unwrap()
+        .trim_end_matches('/')
+        .to_string();
+    let origin = server.origin.clone();
+    let (stop, task) = start_worker(&server, &engine);
+    server.wait_workers(1).await;
+    assert_eq!(evaluate(&server).await.attempts, 1);
+    server.stop().await;
+    let listener = TcpListener::bind(address).await.unwrap();
+    let replacement = Server::on(listener, origin).await;
+    replacement.wait_workers(1).await;
+    assert_eq!(evaluate(&replacement).await.attempts, 1);
+    stop_worker(stop, task).await;
+    replacement.stop().await;
+}
+
+#[tokio::test]
+async fn worker_pool_runs_to_capacity_and_releases_busy_jobs_on_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("busy");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        uci) printf '%s\n' 'id name Stockfish busy' 'uciok' ;;
+        isready) printf '%s\n' 'readyok' ;;
+        go*) exec sleep 30 ;;
+    esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = Server::start().await;
+    let (stop, worker) = start_worker(&server, &path);
+    server.wait_workers(1).await;
+    let mut requests = vec![];
+    for _ in 0..3 {
+        let client = server.client.clone();
+        let origin = server.origin.clone();
+        requests.push(tokio::spawn(async move {
+            client
+                .post(format!("{origin}v1/evaluate"))
+                .bearer_auth(API_KEY)
+                .json(&EvaluateRequest::default())
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let status = server.status().await;
+            if status.running == 2 && status.queued_batch == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    stop_worker(stop, worker).await;
+    let status = server.status().await;
+    assert_eq!(status.retried, 2);
+    assert_eq!(status.queued_batch, 3);
+    assert_eq!(status.running, 0);
+    server.stop().await;
+    for request in requests {
+        assert_eq!(request.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires STOCKFISH_RELAY_TEST_ENGINE pointing to a real Stockfish executable"]
+async fn real_stockfish_roundtrip_supports_history_multipv_forced_moves_and_mate() {
+    let path = std::env::var("STOCKFISH_RELAY_TEST_ENGINE").unwrap();
+    let server = Server::start().await;
+    let (stop, task) = start_worker(&server, Path::new(&path));
+    server.wait_workers(1).await;
+    for request in [
+        EvaluateRequest {
+            moves: vec!["e2e4".into(), "e7e5".into()],
+            multipv: 3,
+            search: Some(SearchLimit::Nodes(30_000)),
+            ..Default::default()
+        },
+        EvaluateRequest {
+            search_moves: vec!["g1f3".into()],
+            search: Some(SearchLimit::Depth(5)),
+            ..Default::default()
+        },
+        EvaluateRequest {
+            search: Some(SearchLimit::MovetimeMs(50)),
+            ..Default::default()
+        },
+        EvaluateRequest {
+            fen: Some("r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1".into()),
+            search_moves: vec!["e1g1".into()],
+            search: Some(SearchLimit::Nodes(10_000)),
+            ..Default::default()
+        },
+        EvaluateRequest {
+            moves: vec!["f2f3".into(), "e7e5".into(), "g2g4".into(), "d8h4".into()],
+            search: Some(SearchLimit::Nodes(1000)),
+            ..Default::default()
+        },
+    ] {
+        let response = server
+            .client
+            .post(format!("{}v1/evaluate", server.origin))
+            .bearer_auth(API_KEY)
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        assert!(status.is_success(), "{body}");
+        let response: EvaluateResponse = serde_json::from_str(&body).unwrap();
+        let normalized = request.normalize(&master_config()).unwrap();
+        response.result.validate(&normalized, &response.result.engine).unwrap();
+        if let Some(forced) = normalized.search_moves.first() {
+            assert_eq!(response.result.best_move.as_ref(), Some(forced));
+        }
+    }
+    stop_worker(stop, task).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn interrupted_multipv_keeps_the_last_complete_exact_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("interrupted-multipv");
+    // Captured from Stockfish 19 with three threads, MultiPV 3, and 30,000 nodes.
+    let transcript = include_str!("fixtures/multipv-interrupted.uci");
+    let script = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        uci) printf '%s\n' 'id name Stockfish fixture' 'uciok' ;;
+        isready) printf '%s\n' 'readyok' ;;
+        go*) cat <<'STOCKFISH_OUTPUT'
+{transcript}STOCKFISH_OUTPUT
+            ;;
+    esac
+done
+"#
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = Server::start().await;
+    let (stop, task) = start_worker(&server, &path);
+    server.wait_workers(1).await;
+    let response: EvaluateResponse = server
+        .client
+        .post(format!("{}v1/evaluate", server.origin))
+        .bearer_auth(API_KEY)
+        .json(&serde_json::json!({
+            "moves": ["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6"],
+            "multipv": 3,
+            "search": {"nodes": 30000}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    stop_worker(stop, task).await;
+    server.stop().await;
+
+    assert_eq!(response.attempts, 1);
+    assert_eq!(response.result.best_move.as_deref(), Some("g1f3"));
+    let variations = response.result.variations;
+    assert_eq!(
+        variations.iter().map(|v| v.pv[0].as_str()).collect::<Vec<_>>(),
+        ["g1f3", "c1g5", "c4d5"]
+    );
+    assert_eq!(
+        variations.iter().map(|v| v.score).collect::<Vec<_>>(),
+        [Score::Centipawns(24), Score::Centipawns(22), Score::Centipawns(18)]
+    );
+    assert!(variations.iter().all(|v| v.depth == 8 && v.nodes == 29307));
+}
+
+#[tokio::test]
+async fn engine_timeout_terminates_the_process_and_never_returns_a_partial_score() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stalled");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        uci) printf '%s\n' 'id name Stockfish stalled' 'uciok' ;;
+        isready) printf '%s\n' 'readyok' ;;
+        go*) printf '%s\n' 'info depth 1 score cp 50 nodes 5 pv e2e4'; exec sleep 30 ;;
+    esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = StockfishConfig {
+        stockfish_path: path,
+        threads: 1,
+        hash_mb: 16,
+    };
+    let mut engine = Stockfish::spawn(&config).await.unwrap();
+    let request = EvaluateRequest::default().normalize(&master_config()).unwrap();
+    let error = engine.evaluate(&request, 50).await.unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    engine.terminate().await.unwrap();
+}

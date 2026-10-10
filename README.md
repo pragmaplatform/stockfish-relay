@@ -1,0 +1,225 @@
+# Stockfish Relay
+
+An HTTP/JSON Stockfish service with remote workers, written in Rust. Run the
+master beside your application and run workers on machines with spare CPU
+capacity. Each worker opens outbound HTTP(S) connections to the master and runs
+a configurable pool of persistent Stockfish processes through UCI.
+
+One binary provides `master` and `worker` modes; `slave` is an alias for `worker`.
+The master uses an in-memory queue and requires no database or Redis. This is a
+standalone project with its own dependencies, lockfile, and build configuration.
+
+## Quick start
+
+Build and install the binary from the repository root:
+
+```bash
+cargo install --path . --locked
+```
+
+Cargo installs it in `~/.cargo/bin`; ensure that directory is on `PATH`. To build
+without installing, use `cargo build --release --locked`. Both machines run the
+same binary. Only workers need a separately installed Stockfish executable;
+Stockfish 19 is tested. Set an absolute path with `STOCKFISH_PATH`.
+
+Copy `.env.example` to `.env`, replace both keys with separately generated values
+(`openssl rand -hex 32`), and adjust the engine path. For a local smoke test, load
+that environment in each of two terminals:
+
+```bash
+set -a
+. ./.env
+set +a
+```
+
+Start the master:
+
+```bash
+stockfish-relay master --listen 127.0.0.1:8080
+```
+
+Start a worker in the other terminal:
+
+```bash
+stockfish-relay worker --master http://127.0.0.1:8080
+```
+
+For deployment, use a master URL such as `https://engine.example.com:443`.
+The master accepts HTTP behind your infrastructure's HTTPS reverse proxy; workers
+verify HTTPS certificates. No inbound listener or port forwarding is needed on
+the worker. A worker needs the worker key; API clients need the separate client key.
+Use one master replica: its queue and worker sessions are process-local.
+
+## Evaluate a position
+
+```bash
+curl --fail-with-body http://127.0.0.1:8080/v1/evaluate \
+  -H "Authorization: Bearer $STOCKFISH_RELAY_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"moves":["e2e4","e7e5"],"search":{"nodes":1000000},"search_moves":["g1f3"]}'
+```
+
+The request waits for completion, including automatic retries. Its response has
+`job_id`, `attempts`, and `result`. The result includes:
+
+- `engine`: the actual UCI engine name, threads, and hash memory.
+- `search`: the resolved search limit.
+- `best_move`: standard UCI notation, or null in a terminal position.
+- `variations`: ordered MultiPV entries with `multipv`, `score`, `depth`, `nodes`,
+  and `pv` (a list of UCI moves).
+- `elapsed_ms`: execution time for the successful attempt, excluding queue time
+  and earlier attempts.
+
+Scores use `{"kind":"centipawns","value":32}` or `{"kind":"mate","value":3}`.
+All variations use the evaluated position's side-to-move perspective. Mate zero
+means that side is already checkmated. Drawn terminal positions have a zero
+centipawn score and no best move. Scores and principal variations are returned;
+the relay does not assign mistake labels or practice grades.
+
+MultiPV results come from a complete batch of exact scores at one depth, with
+distinct candidate moves. If the final update is incomplete or contains bound
+scores, the relay uses the deepest complete batch matching Stockfish's best move.
+If no complete batch matches, the attempt fails and follows the normal retry policy.
+
+| Request field | Behavior |
+| --- | --- |
+| `fen` | Optional starting FEN; omitted means the normal initial board |
+| `moves` | UCI history from that starting board, including castling as `e1g1` and promotion as `e7e8q` |
+| `search` | Exactly one of `{"nodes":1000000}`, `{"depth":20}`, or `{"movetime_ms":1000}`; omitted uses the configured node budget |
+| `search_moves` | Optional restriction on the first move; omitted/empty allows every legal move |
+| `multipv` | Number of variations; defaults to 1, bounded by the master's limit and legal root moves |
+| `priority` | `batch` (default) or `interactive` |
+| `engine` | Optional exact UCI engine name required for routing |
+
+Send move history when available: a bare FEN cannot describe earlier repetitions.
+Positions, moves, limits, and returned continuations are validated. Raw UCI
+commands and filesystem paths are not accepted through the public API. Threads
+and hash memory belong to the worker's configuration, not to individual requests.
+
+`GET /v1/status` (client key) returns workers, capacity, running/queued counts, and
+completed/retried/failed counters. `/healthz` checks the master process; `/readyz`
+requires at least one connected worker. `/openapi.json` serves the generated
+contract, also available with `stockfish-relay openapi > openapi.json`.
+
+## Retries and scheduling
+
+Workers register their engine identity and capacity, then long-poll for jobs.
+Each assignment has a fresh attempt ID and a renewable lease. Heartbeats renew
+only assignments the worker actually acknowledges. A lost claim response therefore
+cannot strand a job indefinitely.
+
+- A reported Stockfish failure immediately requeues the job. The worker discards
+  that process and starts a fresh one for subsequent work.
+- A disconnected worker or expired lease requeues unfinished work. Another
+  available worker can claim it; the original HTTP request keeps waiting.
+- Late results and duplicate completions from old attempts receive `409` and
+  cannot overwrite the current attempt's result.
+- Retries allow at-least-once execution: after a network partition, an old search
+  can briefly overlap its replacement. Only the current assignment is accepted.
+- The default limit is three total attempts, returning `502` after exhaustion.
+  A 120-second overall deadline includes queuing and retries, returning `504`.
+- New requests receive `503` when no matching worker is connected and `429` when
+  capacity is full. Existing requests can wait for workers to reconnect until
+  their deadline. A master restart loses pending jobs; callers must retry.
+- Workers reconnect automatically. On shutdown they stop their processes and
+  release their assignments; leases recover work if that release cannot reach
+  the master. Cancelled or timed-out assignments are stopped on the next heartbeat.
+
+Interactive jobs take precedence when selecting queued work. After eight
+interactive assignments, a compatible waiting batch job gets a turn. Running
+jobs are not preempted. There is no persistent result cache; applications can
+cache evaluations using the complete history, actual engine configuration, and
+search settings. Parallel requests are needed to use multiple worker slots.
+
+## Configuration
+
+Every setting supports environment variables and CLI flags; flags take precedence.
+Run `stockfish-relay master --help` or `stockfish-relay worker --help` for the flags.
+The binary does not automatically load `.env` files.
+
+| Variable | Default | Applies to |
+| --- | --- | --- |
+| `STOCKFISH_RELAY_API_KEY` | Required | Master/client authentication |
+| `STOCKFISH_RELAY_WORKER_KEY` | Required | Master/worker authentication |
+| `STOCKFISH_RELAY_LISTEN` | `127.0.0.1:8080` | Master |
+| `STOCKFISH_RELAY_MASTER_URL` | Required | Worker; scheme, host, optional port |
+| `STOCKFISH_RELAY_WORKER_NAME` | `worker` | Worker display name |
+| `STOCKFISH_RELAY_CONCURRENCY` | `1` | Stockfish processes per worker |
+| `STOCKFISH_PATH` | `stockfish` on PATH | Worker executable |
+| `STOCKFISH_THREADS` | `1` | Threads per engine |
+| `STOCKFISH_HASH_MB` | `64` | Hash memory per engine, plus engine overhead |
+| `STOCKFISH_RELAY_QUEUE_CAPACITY` | `128` | Master; queued and executing requests combined |
+| `STOCKFISH_RELAY_MAX_ATTEMPTS` | `3` | Master; includes initial attempt |
+| `STOCKFISH_RELAY_LEASE_MS` | `15000` | Master; heartbeat interval is one third of this |
+| `STOCKFISH_RELAY_LONG_POLL_MS` | `20000` | Master |
+| `STOCKFISH_RELAY_REQUEST_TIMEOUT_MS` | `120000` | Master; total request deadline |
+| `STOCKFISH_RELAY_SEARCH_TIMEOUT_MS` | `30000` | Per attempt; enforced on the worker |
+| `STOCKFISH_RELAY_DEFAULT_NODES` | `1000000` | Master; omitted search limit |
+| `STOCKFISH_RELAY_MAX_NODES` | `50000000` | Master |
+| `STOCKFISH_RELAY_MAX_DEPTH` | `40` | Master |
+| `STOCKFISH_RELAY_MAX_MULTIPV` | `5` | Master |
+| `RUST_LOG` | `info` | Both |
+
+For example, four processes with three threads each use roughly twelve search
+threads. Hash memory also multiplies by concurrency; neural networks and process
+overhead consume additional RAM. Set these values to leave capacity for CI builds.
+Explicit move time must be below the hard search timeout. Configure the reverse
+proxy and API client timeout to exceed the master's overall request deadline.
+
+## Ubuntu worker service
+
+Install the relay binary at `/usr/local/bin/stockfish-relay` and Stockfish at
+`/opt/stockfish/stockfish`, both executable by the service user. The following are
+deployment commands to run on the intended worker host:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin stockfish-relay
+sudo install -d -m 0750 -o root -g stockfish-relay /etc/stockfish-relay
+sudo install -m 0640 -o root -g stockfish-relay deploy/worker.env.example /etc/stockfish-relay/worker.env
+sudoedit /etc/stockfish-relay/worker.env
+sudo install -m 0644 deploy/stockfish-relay-worker.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now stockfish-relay-worker
+journalctl -u stockfish-relay-worker -f
+```
+
+The service runs at lower CPU priority than normal builds. Its thread/process
+limits still need to match the capacity you want to dedicate to analysis.
+
+## Container and Render
+
+Build from the repository root:
+
+```bash
+docker build -t stockfish-relay .
+docker run --rm -p 8080:8080 --env-file .env -e STOCKFISH_RELAY_LISTEN=0.0.0.0:8080 stockfish-relay
+```
+
+The image runs as UID 10001 and contains the relay only. To use it as a worker,
+mount your Linux-compatible Stockfish distribution read-only at `/opt/stockfish`
+and pass `worker --master https://engine.example.com:443`. Point
+`STOCKFISH_PATH` to the executable inside that mount.
+
+`render.yaml` is a master blueprint with generated client/worker keys.
+Use `/healthz` for the platform health check so deployment does not
+depend on the CI worker being online. Supply the generated worker key to the CI
+host and the client key to API consumers. No Render deployment or resize is
+performed by building this project.
+
+## Verification and licensing
+
+```bash
+cargo test
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+STOCKFISH_RELAY_TEST_ENGINE=/opt/stockfish/stockfish cargo test --test end_to_end real_stockfish_roundtrip -- --ignored
+```
+
+Ordinary tests use local test engines and need no database or installed Stockfish.
+They exercise disconnect recovery, stale results, engine crashes, limits, HTTP
+authentication, master restart, and the worker protocol. The opt-in real-engine
+test checks history, multiple variations, forced moves, castling, and checkmate.
+
+Relay code is MIT licensed; see `LICENSE`. Stockfish is a separate GPLv3 program.
+If distributing it with your deployment, include its license and corresponding
+source as required by the [upstream terms](https://github.com/official-stockfish/Stockfish#terms-of-use).

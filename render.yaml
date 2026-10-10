@@ -1,0 +1,23 @@
+# Blueprint paths are relative to this repository's root.
+services:
+  - name: stockfish-relay
+    type: web
+    runtime: docker
+    dockerContext: .
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: STOCKFISH_RELAY_LISTEN
+        value: 0.0.0.0:10000
+      - key: STOCKFISH_RELAY_API_KEY
+        generateValue: true
+      - key: STOCKFISH_RELAY_WORKER_KEY
+        generateValue: true
+      - key: STOCKFISH_RELAY_QUEUE_CAPACITY
+        value: "128"
+      - key: STOCKFISH_RELAY_MAX_ATTEMPTS
+        value: "3"
+      - key: STOCKFISH_RELAY_REQUEST_TIMEOUT_MS
+        value: "120000"
+      - key: STOCKFISH_RELAY_SEARCH_TIMEOUT_MS
+        value: "30000"

@@ -1,0 +1,23 @@
+[Unit]
+Description=Stockfish Relay worker
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=stockfish-relay
+Group=stockfish-relay
+EnvironmentFile=/etc/stockfish-relay/worker.env
+ExecStart=/usr/local/bin/stockfish-relay worker
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+Nice=10
+CPUWeight=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
