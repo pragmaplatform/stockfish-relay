@@ -139,6 +139,7 @@ The binary does not automatically load `.env` files.
 
 | Variable | Default | Applies to |
 | --- | --- | --- |
+| `STOCKFISH_RELAY_MODE` | `master` | Docker; `master` or `worker` (`slave` alias) |
 | `STOCKFISH_RELAY_API_KEY` | Required | Master/client authentication |
 | `STOCKFISH_RELAY_WORKER_KEY` | Required | Master/worker authentication |
 | `STOCKFISH_RELAY_LISTEN` | `127.0.0.1:8080` | Master |
@@ -192,13 +193,49 @@ Build from the repository root:
 
 ```bash
 docker build -t stockfish-relay .
-docker run --rm -p 8080:8080 --env-file .env -e STOCKFISH_RELAY_LISTEN=0.0.0.0:8080 stockfish-relay
 ```
 
-The image runs as UID 10001 and contains the relay only. To use it as a worker,
-mount your Linux-compatible Stockfish distribution read-only at `/opt/stockfish`
-and pass `worker --master https://engine.example.com:443`. Point
-`STOCKFISH_PATH` to the executable inside that mount.
+The image runs as UID 10001 and includes the relay and Debian's packaged
+Stockfish. Configure every runtime setting with environment variables from the
+table above. `STOCKFISH_RELAY_MODE` selects `master` (the default) or `worker`;
+`slave` is also accepted as a worker alias. Mode selection through this variable
+is provided by the container entrypoint.
+
+Start a master using `.env` with your generated keys:
+
+```bash
+docker run --rm -p 8080:8080 --env-file .env \
+  -e STOCKFISH_RELAY_MODE=master \
+  -e STOCKFISH_RELAY_LISTEN=0.0.0.0:8080 \
+  stockfish-relay
+```
+
+Start a worker pointed at a reachable master:
+
+```bash
+docker run --rm --env-file .env \
+  -e STOCKFISH_RELAY_MODE=worker \
+  -e STOCKFISH_RELAY_MASTER_URL=https://engine.example.com:443 \
+  -e STOCKFISH_PATH=/usr/games/stockfish \
+  -e STOCKFISH_RELAY_CONCURRENCY=2 \
+  -e STOCKFISH_THREADS=1 \
+  -e STOCKFISH_HASH_MB=64 \
+  stockfish-relay
+```
+
+Workers need the master's worker key and require no published ports. The image
+defaults to listening on `0.0.0.0:8080` and uses `/usr/games/stockfish`; the examples
+override the host-specific paths and addresses in `.env.example`. A worker's
+master URL must be reachable from its container; `127.0.0.1` refers to that
+container itself.
+
+To use a different engine version, mount a Linux-compatible Stockfish distribution
+read-only and set `STOCKFISH_PATH` to its executable inside the container.
+Explicit command arguments override the mode variable, for example
+`docker run --rm stockfish-relay worker --help` or
+`docker run --rm stockfish-relay openapi`. CLI flags still override environment
+settings. The entrypoint executes the relay directly so it receives container
+shutdown signals.
 
 `render.yaml` is a master blueprint with generated client/worker keys.
 Use `/healthz` for the platform health check so deployment does not
@@ -207,6 +244,10 @@ host and the client key to API consumers. No Render deployment or resize is
 performed by building this project.
 
 ## Verification and licensing
+
+GitHub Actions runs formatting, Clippy, the ordinary test suite, and the real
+Stockfish integration test on every push and pull request. CI uses Ubuntu 24.04,
+Rust 1.98.1, and Ubuntu's packaged Stockfish executable.
 
 ```bash
 cargo test
