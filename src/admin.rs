@@ -93,15 +93,27 @@ fn render(mut status: Status) -> String {
             "<p class=\"empty\">No workers connected. Workers will appear here when they register with the master.</p>",
         );
     } else {
-        content.push_str("<div class=\"table-wrap\" tabindex=\"0\" role=\"region\" aria-label=\"Connected workers\"><table><thead><tr><th scope=\"col\">Worker</th><th scope=\"col\">Engine</th><th scope=\"col\">Running / slots</th><th scope=\"col\">Threads / engine</th><th scope=\"col\">Hash / engine</th></tr></thead><tbody>");
+        content.push_str("<div class=\"table-wrap\" tabindex=\"0\" role=\"region\" aria-label=\"Connected workers\"><table><thead><tr><th scope=\"col\">Worker</th><th scope=\"col\">Uptime</th><th scope=\"col\">Engine</th><th scope=\"col\">Running / slots</th><th scope=\"col\">Threads / engine</th><th scope=\"col\">Hash / engine</th></tr></thead><tbody>");
         for worker in status.workers {
-            write!(content, "<tr><th scope=\"row\">{}<small>{}</small></th><td>{}</td><td>{} / {}</td><td>{}</td><td>{} MB</td></tr>",
-                escape(&worker.name), worker.id, escape(&worker.engine.name), worker.running, worker.capacity, worker.engine.threads, worker.engine.hash_mb).unwrap();
+            write!(content, "<tr><th scope=\"row\">{}<small>{}</small></th><td>{}</td><td>{}</td><td>{} / {}</td><td>{}</td><td>{} MB</td></tr>",
+                escape(&worker.name), worker.id, format_uptime(worker.uptime_seconds), escape(&worker.engine.name), worker.running, worker.capacity, worker.engine.threads, worker.engine.hash_mb).unwrap();
         }
         content.push_str("</tbody></table></div>");
     }
     content.push_str("</section>");
-    include_str!("admin.html").replace("{{content}}", &content)
+    include_str!("admin.html")
+        .replace("{{uptime}}", &format_uptime(status.uptime_seconds))
+        .replace("{{content}}", &content)
+}
+
+fn format_uptime(seconds: u64) -> String {
+    format!(
+        "{}d {}h {}m {}s",
+        seconds / 86_400,
+        seconds / 3600 % 24,
+        seconds / 60 % 60,
+        seconds % 60
+    )
 }
 
 fn escape(value: &str) -> String {

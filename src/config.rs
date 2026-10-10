@@ -76,7 +76,11 @@ impl MasterConfig {
                         "Admin username must be nonempty printable non-space ASCII without ':'".into(),
                     ));
                 }
-                valid_key(password)?;
+                if password.len() < 4 || !password.bytes().all(|byte| byte.is_ascii_graphic()) {
+                    return Err(Error::Configuration(
+                        "Admin password needs at least 4 printable non-space ASCII characters".into(),
+                    ));
+                }
                 if password == &self.api_key || password == &self.worker_key {
                     return Err(Error::Configuration(
                         "Admin password must differ from client and worker keys".into(),

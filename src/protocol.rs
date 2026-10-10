@@ -156,6 +156,8 @@ pub struct Completion {
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct Status {
+    /// Elapsed seconds since the master started; resets on restart.
+    pub uptime_seconds: u64,
     pub queued_interactive: usize,
     pub queued_batch: usize,
     pub running: usize,
@@ -169,6 +171,8 @@ pub struct Status {
 pub struct WorkerStatus {
     pub id: Uuid,
     pub name: String,
+    /// Elapsed seconds since this worker registered; resets on reconnection.
+    pub uptime_seconds: u64,
     pub capacity: u16,
     pub running: usize,
     pub engine: EngineInfo,

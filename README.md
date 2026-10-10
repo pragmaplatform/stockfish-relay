@@ -96,9 +96,10 @@ Positions, moves, limits, and returned continuations are validated. Raw UCI
 commands and filesystem paths are not accepted through the public API. Threads
 and hash memory belong to the worker's configuration, not to individual requests.
 
-`GET /v1/status` (client key) returns workers, capacity, running/queued counts, and
-completed/retried/failed counters. `/healthz` checks the master process; `/readyz`
-requires at least one connected worker. `/openapi.json` serves the generated
+`GET /v1/status` (client key) returns master and worker uptime in seconds (`uptime_seconds`),
+workers, capacity, running/queued counts, and completed/retried/failed counters.
+`/healthz` checks the master process; `/readyz` requires at least one connected
+worker. `/openapi.json` serves the generated
 contract, also available with `stockfish-relay openapi > openapi.json`.
 
 ## Admin dashboard
@@ -108,15 +109,17 @@ master, then open `/admin` on its existing HTTP address. The browser prompts for
 these separate HTTP Basic Auth credentials. Serve it through the same HTTPS
 reverse proxy used for the API when accessing it remotely.
 
-The read-only page reloads every five seconds and shows connected workers,
-engine names, running/available slots, configured threads and hash memory per
-engine, interactive/batch queue sizes, and completed/retried/failed totals.
-Totals reset when the master restarts; disconnected workers disappear. There
-is no historical storage or collection of actual CPU/RAM usage.
+The read-only page reloads every five seconds and shows master uptime, connected
+workers and their uptime, engine names, running/available slots, configured threads
+and hash memory per engine, interactive/batch queue sizes, and
+completed/retried/failed totals. Master uptime and totals reset when the master
+restarts. Worker uptime measures time since registration and resets on each new
+connection; disconnected workers disappear. There is no historical storage or
+collection of actual CPU/RAM usage.
 
 The dashboard is disabled (404) when both settings are absent. Setting only one
 is a configuration error. The username must be printable non-space ASCII without
-a colon. The password must contain at least 16 printable non-space ASCII
+a colon. The password must contain at least 4 printable non-space ASCII
 characters and differ from the client and worker keys; generate one with
 `openssl rand -hex 32`. Admin credentials only authorize the dashboard.
 On Render, add both variables to the master service's environment to enable it.
@@ -225,7 +228,7 @@ GitHub Actions publishes the `linux/amd64` image to
 `ghcr.io/pragmaplatform/stockfish-relay` after all CI checks pass:
 
 - Pushes to the default branch (`main`) publish the package version from
-  `Cargo.toml` (currently `0.2.0`), `latest`, and `sha-<full-commit-sha>`.
+  `Cargo.toml` (currently `0.2.1`), `latest`, and `sha-<full-commit-sha>`.
   The package-version tag updates on each successful main build until the version
   changes; use the commit tag or image digest to pin a specific build.
 - Version tag pushes such as `v1.2.3` publish `1.2.3`. Prerelease tags such as
