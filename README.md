@@ -145,6 +145,16 @@ cannot strand a job indefinitely.
   release their assignments; leases recover work if that release cannot reach
   the master. Cancelled or timed-out assignments are stopped on the next heartbeat.
 
+When deploying a replacement master, keep its URL and worker key unchanged.
+Running workers abandon their old session and stop its searches when they detect
+a connection failure, a temporary server error, or an unknown session. They retry
+registration with exponential backoff (starting at one second, capped at 30
+seconds, plus up to 255 ms jitter), then resume processing with a fresh session.
+Workers do not need to be restarted. Pending requests do not survive the master
+restart: a graceful shutdown returns `503`, and callers must retry once workers
+have reconnected (`/readyz` returns success). Authentication errors (`401`/`403`)
+and invalid requests (`400`) stop the worker instead of retrying.
+
 Interactive jobs take precedence when selecting queued work. After eight
 interactive assignments, a compatible waiting batch job gets a turn. Running
 jobs are not preempted. There is no persistent result cache; applications can

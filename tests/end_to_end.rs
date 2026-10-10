@@ -530,6 +530,150 @@ async fn worker_reconnects_after_master_restart() {
 }
 
 #[tokio::test]
+async fn worker_reconnects_after_repeated_deployment_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = fixture(dir.path(), false);
+    let server = Server::start().await;
+    let origin = server.origin.clone();
+    let address = origin.strip_prefix("http://").unwrap().trim_end_matches('/');
+    let (stop, task) = start_worker(&server, &engine);
+    server.wait_workers(1).await;
+    let previous_id = server.status().await.workers[0].id;
+    assert_eq!(evaluate(&server).await.attempts, 1);
+    server.stop().await;
+
+    // A deployment proxy can remain reachable while its master is unavailable.
+    let listener = TcpListener::bind(address).await.unwrap();
+    let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+    let unavailable = axum::Router::new()
+        .route(
+            "/v1/workers/register",
+            axum::routing::post(move || {
+                let attempted = attempted.clone();
+                async move {
+                    attempted.send(()).unwrap();
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
+        .fallback(|| async { StatusCode::BAD_GATEWAY });
+    let outage_stop = CancellationToken::new();
+    let outage_shutdown = outage_stop.clone();
+    let outage = tokio::spawn(async move {
+        axum::serve(listener, unavailable)
+            .with_graceful_shutdown(outage_shutdown.cancelled_owned())
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(8), async {
+        for _ in 0..2 {
+            attempts.recv().await.unwrap();
+        }
+    })
+    .await
+    .expect("worker must keep retrying registration throughout the outage");
+    assert!(!task.is_finished());
+    outage_stop.cancel();
+    tokio::time::timeout(Duration::from_secs(3), outage)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let listener = TcpListener::bind(address).await.unwrap();
+    let replacement = Server::on(listener, origin).await;
+    replacement.wait_workers(1).await;
+    assert_ne!(replacement.status().await.workers[0].id, previous_id);
+    assert_eq!(evaluate(&replacement).await.attempts, 1);
+    stop_worker(stop, task).await;
+    replacement.stop().await;
+}
+
+#[tokio::test]
+async fn busy_worker_reconnects_after_master_deployment() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = dir.path().join("stockfish");
+    let resume = dir.path().join("resume");
+    let started = dir.path().join("started");
+    std::fs::write(
+        &engine,
+        format!(
+            r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        uci) printf '%s\n' 'id name Stockfish fixture' 'uciok' ;;
+        isready) printf '%s\n' 'readyok' ;;
+        go*)
+            if [ ! -f '{}' ]; then
+                printf '%s\n' started >> '{}'
+                exec sleep 30
+            fi
+            printf '%s\n' 'info depth 10 score cp 25 nodes 1000 pv e2e4 e7e5' 'bestmove e2e4'
+            ;;
+    esac
+done
+"#,
+            resume.display(),
+            started.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&engine, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = format!("http://{address}/");
+    let mut config = master_config();
+    // Recovery must cancel the old searches, rather than wait for their timeout.
+    config.search_timeout_ms = 30_000;
+    config.request_timeout_ms = 60_000;
+    let server = Server::with_config(listener, origin.clone(), config).await;
+    let (stop, task) = start_worker(&server, &engine);
+    server.wait_workers(1).await;
+    let previous_id = server.status().await.workers[0].id;
+    let mut requests = Vec::new();
+    for _ in 0..2 {
+        let client = server.client.clone();
+        let origin = origin.clone();
+        requests.push(tokio::spawn(async move {
+            client
+                .post(format!("{origin}v1/evaluate"))
+                .bearer_auth(API_KEY)
+                .json(&EvaluateRequest::default())
+                .send()
+                .await
+                .unwrap()
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while std::fs::read_to_string(&started).unwrap_or_default().lines().count() != 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(server.status().await.running, 2);
+    server.stop().await;
+    for request in requests {
+        assert_eq!(request.await.unwrap().status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    std::fs::write(resume, "").unwrap();
+
+    let listener = TcpListener::bind(address).await.unwrap();
+    let replacement = Server::on(listener, origin).await;
+    replacement.wait_workers(1).await;
+    let status = replacement.status().await;
+    assert_ne!(status.workers[0].id, previous_id);
+    assert_eq!(status.workers[0].capacity, 2);
+    assert_eq!(status.running, 0);
+    assert!(!task.is_finished());
+    let (first, second) = tokio::join!(evaluate(&replacement), evaluate(&replacement));
+    assert_eq!(first.attempts, 1);
+    assert_eq!(second.attempts, 1);
+    assert_eq!(replacement.status().await.completed, 2);
+    stop_worker(stop, task).await;
+    replacement.stop().await;
+}
+
+#[tokio::test]
 async fn worker_pool_runs_to_capacity_and_releases_busy_jobs_on_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("busy");
