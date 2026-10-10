@@ -22,6 +22,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Master {
     pub config: Arc<MasterConfig>,
+    started_at: Instant,
     state: Arc<Mutex<State>>,
     changed: Arc<Notify>,
 }
@@ -56,6 +57,7 @@ struct Lease {
 
 struct Worker {
     registration: RegisterWorker,
+    connected_at: Instant,
     seen: Instant,
 }
 
@@ -95,6 +97,7 @@ impl Master {
         config.validate()?;
         Ok(Self {
             config: Arc::new(config),
+            started_at: Instant::now(),
             state: Arc::new(Mutex::new(State::default())),
             changed: Arc::new(Notify::new()),
         })
@@ -166,12 +169,14 @@ impl Master {
             return Err(ApiError::unavailable("Master is shutting down"));
         }
         let worker_id = Uuid::new_v4();
+        let connected_at = Instant::now();
         tracing::info!(%worker_id, name = %registration.name, capacity = registration.capacity, engine = %registration.engine.name, "Worker registered");
         state.workers.insert(
             worker_id,
             Worker {
                 registration,
-                seen: Instant::now(),
+                connected_at,
+                seen: connected_at,
             },
         );
         drop(state);
@@ -341,6 +346,7 @@ impl Master {
         let mut state = self.state.lock().await;
         state.maintain(&self.config);
         Status {
+            uptime_seconds: self.started_at.elapsed().as_secs(),
             queued_interactive: state.interactive.len(),
             queued_batch: state.batch.len(),
             running: state.jobs.values().filter(|job| job.lease.is_some()).count(),
@@ -353,6 +359,7 @@ impl Master {
                 .map(|(id, worker)| WorkerStatus {
                     id: *id,
                     name: worker.registration.name.clone(),
+                    uptime_seconds: worker.connected_at.elapsed().as_secs(),
                     capacity: worker.registration.capacity,
                     running: state.running(*id),
                     engine: worker.registration.engine.clone(),

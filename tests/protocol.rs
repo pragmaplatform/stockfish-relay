@@ -27,8 +27,10 @@ fn admin_credentials_must_be_complete_valid_and_separate() {
     assert!(config.validate().is_ok());
     config.admin_username = Some("admin".into());
     assert!(config.validate().is_err());
-    config.admin_password = Some("admin-password-for-tests".into());
-    assert!(config.validate().is_ok());
+    for password in ["abcd", "short", "admin-password-for-tests"] {
+        config.admin_password = Some(password.into());
+        assert!(config.validate().is_ok());
+    }
     for username in [None, Some(""), Some("user:name"), Some("two words"), Some("user\nname")] {
         config.admin_username = username.map(str::to_owned);
         assert!(config.validate().is_err());
@@ -36,7 +38,7 @@ fn admin_credentials_must_be_complete_valid_and_separate() {
     config.admin_username = Some("admin".into());
     for password in [
         "",
-        "short",
+        "abc",
         "password with spaces",
         "password-with-newline\n",
         &config.api_key.clone(),
