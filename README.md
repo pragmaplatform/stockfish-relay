@@ -9,6 +9,8 @@ One binary provides `master` and `worker` modes; `slave` is an alias for `worker
 The master uses an in-memory queue and requires no database or Redis. This is a
 standalone project with its own dependencies, lockfile, and build configuration.
 
+See the [changelog](CHANGELOG.md) for changes by version.
+
 ## Quick start
 
 Build and install the binary from the repository root:
