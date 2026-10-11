@@ -115,6 +115,9 @@ pub struct WorkerSession {
     pub lease_ms: u64,
     pub heartbeat_ms: u64,
     pub long_poll_ms: u64,
+    /// Supports completing a job and long-polling for the next assignment in one request.
+    #[serde(default)]
+    pub complete_and_claim: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Deserialize, Serialize, ToSchema)]

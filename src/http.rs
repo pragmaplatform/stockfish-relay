@@ -34,6 +34,7 @@ pub fn router(master: Master) -> Router {
         .route("/v1/workers/{worker_id}/claim", post(claim))
         .route("/v1/workers/{worker_id}/heartbeat", post(heartbeat))
         .route("/v1/workers/{worker_id}/complete", post(complete))
+        .route("/v1/workers/{worker_id}/complete-and-claim", post(complete_and_claim))
         .route("/v1/workers/{worker_id}", delete(unregister))
         .route_layer(middleware::from_fn_with_state(
             Arc::new(master.config.worker_key.clone()),
@@ -57,7 +58,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 #[derive(OpenApi)]
 #[openapi(
     info(title = "Stockfish Relay", description = "Stockfish evaluation over HTTP with remote workers. Worker protocol version 1."),
-    paths(health, ready, evaluate, status, register, claim, heartbeat, complete, unregister),
+    paths(health, ready, evaluate, status, register, claim, heartbeat, complete, complete_and_claim, unregister),
     components(schemas(ErrorBody)),
     modifiers(&Security)
 )]
@@ -150,6 +151,19 @@ async fn complete(
 ) -> Result<StatusCode, ApiError> {
     master.complete(worker_id, payload(body)?).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Publishes the completed result immediately, then long-polls for the next job.
+#[utoipa::path(post, path = "/v1/workers/{worker_id}/complete-and-claim", tag = "Workers", params(("worker_id" = Uuid, Path)), request_body = Completion, security(("worker_key" = [])), responses((status = 200, body = Assignment), (status = 204, description = "Result accepted; no compatible work within the long-poll interval"), (status = 400, body = ErrorBody), (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]
+async fn complete_and_claim(
+    State(master): State<Master>,
+    Path(worker_id): Path<Uuid>,
+    body: Result<Json<Completion>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    Ok(match master.complete_and_claim(worker_id, payload(body)?).await? {
+        Some(assignment) => Json(assignment).into_response(),
+        None => StatusCode::NO_CONTENT.into_response(),
+    })
 }
 
 #[utoipa::path(delete, path = "/v1/workers/{worker_id}", tag = "Workers", params(("worker_id" = Uuid, Path)), security(("worker_key" = [])), responses((status = 204), (status = 404, body = ErrorBody)))]

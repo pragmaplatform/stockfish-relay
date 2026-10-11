@@ -186,6 +186,7 @@ impl Master {
             lease_ms: self.config.lease_ms,
             heartbeat_ms: self.config.lease_ms / 3,
             long_poll_ms: self.config.long_poll_ms,
+            complete_and_claim: true,
         })
     }
 
@@ -317,6 +318,15 @@ impl Master {
         drop(state);
         self.changed.notify_waiters();
         Ok(())
+    }
+
+    pub async fn complete_and_claim(
+        &self,
+        worker_id: Uuid,
+        completion: Completion,
+    ) -> Result<Option<Assignment>, ApiError> {
+        self.complete(worker_id, completion).await?;
+        self.claim(worker_id).await
     }
 
     pub async fn unregister(&self, worker_id: Uuid) -> Result<(), ApiError> {
