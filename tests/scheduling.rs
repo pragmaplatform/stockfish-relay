@@ -69,6 +69,47 @@ fn success(assignment: &Assignment) -> Completion {
 }
 
 #[tokio::test(start_paused = true)]
+async fn complete_and_claim_publishes_before_waiting_and_rejects_stale_completions() {
+    let master = Master::new(config()).unwrap();
+    let session = master.register(worker()).await.unwrap();
+    assert!(session.complete_and_claim);
+    let first = submit(&master, EvaluateRequest::default()).await;
+    let assignment = master.claim(session.worker_id).await.unwrap().unwrap();
+    let next = {
+        let master = master.clone();
+        let completion = success(&assignment);
+        tokio::spawn(async move { master.complete_and_claim(session.worker_id, completion).await })
+    };
+    assert_eq!(first.await.unwrap().unwrap().job_id, assignment.id.job_id);
+    assert!(!next.is_finished(), "Completed result must not wait for the next job");
+
+    let second = submit(&master, EvaluateRequest::default()).await;
+    let second_assignment = next.await.unwrap().unwrap().unwrap();
+    assert_ne!(second_assignment.id.job_id, assignment.id.job_id);
+    let third = submit(&master, EvaluateRequest::default()).await;
+    assert_eq!(
+        master
+            .complete_and_claim(session.worker_id, success(&assignment))
+            .await
+            .unwrap_err()
+            .status,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(master.status().await.queued_batch, 1);
+    let third_assignment = master
+        .complete_and_claim(session.worker_id, success(&second_assignment))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.await.unwrap().unwrap().job_id, second_assignment.id.job_id);
+    master
+        .complete(session.worker_id, success(&third_assignment))
+        .await
+        .unwrap();
+    assert_eq!(third.await.unwrap().unwrap().job_id, third_assignment.id.job_id);
+}
+
+#[tokio::test(start_paused = true)]
 async fn disconnected_worker_retries_the_same_request_and_rejects_late_results() {
     let master = Master::new(config()).unwrap();
     let disconnected = master.register(worker()).await.unwrap();

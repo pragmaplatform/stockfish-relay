@@ -404,6 +404,119 @@ async fn http_roles_health_validation_and_missing_capacity() {
 }
 
 #[tokio::test]
+async fn worker_negotiates_complete_and_claim_and_supports_legacy_masters() {
+    for legacy in [false, true] {
+        exercise_worker_transport(legacy, Duration::ZERO, 3).await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "Manual transport benchmark with 50 ms simulated worker round-trip latency"]
+async fn worker_transport_latency_benchmark() {
+    for legacy in [true, false] {
+        let elapsed = exercise_worker_transport(legacy, Duration::from_millis(25), 24).await;
+        eprintln!(
+            "legacy={legacy} jobs=24 simulated_rtt_ms=50 elapsed_ms={}",
+            elapsed.as_millis()
+        );
+    }
+}
+
+async fn exercise_worker_transport(legacy: bool, latency: Duration, jobs: usize) -> Duration {
+    use std::{collections::HashMap, sync::Arc};
+
+    use axum::{Router, body::to_bytes, extract::Request, routing::any};
+    use tokio::sync::Mutex;
+
+    let server = Server::start().await;
+    let counts = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+    let captured = counts.clone();
+    let origin = server.origin.clone();
+    let forward = Client::new();
+    let proxy = Router::new().fallback(any(move |request: Request| {
+        let counts = captured.clone();
+        let origin = origin.clone();
+        let forward = forward.clone();
+        async move {
+            tokio::time::sleep(latency).await;
+            let (parts, body) = request.into_parts();
+            let action = parts.uri.path().rsplit('/').next().unwrap().to_owned();
+            *counts.lock().await.entry(action.clone()).or_default() += 1;
+            let body = to_bytes(body, 256 * 1024).await.unwrap();
+            let response = forward
+                .request(
+                    parts.method,
+                    format!("{}{}", origin, parts.uri.path().trim_start_matches('/')),
+                )
+                .headers(parts.headers)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let mut body = response.bytes().await.unwrap().to_vec();
+            if legacy && action == "register" {
+                let mut session: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                session.as_object_mut().unwrap().remove("complete_and_claim");
+                body = serde_json::to_vec(&session).unwrap();
+            }
+            tokio::time::sleep(latency).await;
+            (status, body)
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let proxy_task = tokio::spawn(async move { axum::serve(listener, proxy).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let engine = fixture(dir.path(), false);
+    let mut config = worker_config(&server, &engine);
+    config.master = format!("http://{address}/").parse().unwrap();
+    config.concurrency = 1;
+    let stop = CancellationToken::new();
+    let shutdown = stop.clone();
+    let task = tokio::spawn(async move { worker::run(config, shutdown).await });
+    server.wait_workers(1).await;
+    let started = std::time::Instant::now();
+    let mut calls = tokio::task::JoinSet::new();
+    for _ in 0..jobs {
+        let client = server.client.clone();
+        let origin = server.origin.clone();
+        calls.spawn(async move {
+            client
+                .post(format!("{origin}v1/evaluate"))
+                .bearer_auth(API_KEY)
+                .json(&EvaluateRequest::default())
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json::<EvaluateResponse>()
+                .await
+                .unwrap()
+        });
+    }
+    while let Some(response) = calls.join_next().await {
+        assert_eq!(response.unwrap().attempts, 1);
+    }
+    let elapsed = started.elapsed();
+    let counts = counts.lock().await;
+    assert_eq!(
+        counts.get("complete").copied().unwrap_or(0),
+        if legacy { jobs } else { 0 }
+    );
+    assert_eq!(
+        counts.get("complete-and-claim").copied().unwrap_or(0),
+        if legacy { 0 } else { jobs }
+    );
+    drop(counts);
+    stop_worker(stop, task).await;
+    server.stop().await;
+    proxy_task.abort();
+    elapsed
+}
+
+#[tokio::test]
 async fn real_http_worker_restarts_a_crashed_engine_and_completes_the_original_call() {
     let dir = tempfile::tempdir().unwrap();
     let engine = fixture(dir.path(), true);

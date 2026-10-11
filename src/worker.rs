@@ -203,16 +203,21 @@ impl Session {
     }
 
     async fn slot_loop(&self, engine: &mut Option<Stockfish>) -> Result<(), Error> {
+        let mut next_assignment: Option<Assignment> = None;
         loop {
-            let response = tokio::select! {
-                _ = self.stop.cancelled() => return Ok(()),
-                response = self.client.post(self.endpoint("claim"))
-                    .timeout(Duration::from_millis(self.registration.long_poll_ms + 5000)).send() => response?,
+            let assignment = if let Some(assignment) = next_assignment.take() {
+                assignment
+            } else {
+                let response = tokio::select! {
+                    _ = self.stop.cancelled() => return Ok(()),
+                    response = self.client.post(self.endpoint("claim"))
+                        .timeout(Duration::from_millis(self.registration.long_poll_ms + 5000)).send() => response?,
+                };
+                if response.status() == StatusCode::NO_CONTENT {
+                    continue;
+                }
+                response.error_for_status()?.json().await?
             };
-            if response.status() == StatusCode::NO_CONTENT {
-                continue;
-            }
-            let assignment: Assignment = response.error_for_status()?.json().await?;
             let stop = self.stop.child_token();
             self.active.lock().await.insert(assignment.id, stop.clone());
             let searched = tokio::select! {
@@ -253,14 +258,27 @@ impl Session {
                 assignment: assignment.id,
                 outcome,
             };
+            let (action, timeout) = if self.registration.complete_and_claim {
+                (
+                    "complete-and-claim",
+                    Duration::from_millis(self.registration.long_poll_ms + 5000),
+                )
+            } else {
+                ("complete", self.network_timeout())
+            };
+            // The completed assignment must not remain in heartbeats during the next long-poll.
+            self.active.lock().await.remove(&assignment.id);
             let response = tokio::select! {
                 _ = self.stop.cancelled() => return Ok(()),
-                response = self.client.post(self.endpoint("complete")).timeout(self.network_timeout())
+                response = self.client.post(self.endpoint(action)).timeout(timeout)
                     .json(&completion).send() => response?,
             };
-            self.active.lock().await.remove(&assignment.id);
-            if response.status() != StatusCode::CONFLICT {
-                response.error_for_status()?;
+            if response.status() == StatusCode::CONFLICT {
+                continue;
+            }
+            let response = response.error_for_status()?;
+            if self.registration.complete_and_claim && response.status() != StatusCode::NO_CONTENT {
+                next_assignment = Some(response.json().await?);
             }
         }
     }

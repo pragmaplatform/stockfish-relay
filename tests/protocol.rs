@@ -179,6 +179,7 @@ fn openapi_describes_the_public_api_worker_protocol_and_separate_keys() {
     let schema = serde_json::to_value(http::openapi()).unwrap();
     assert!(schema["paths"]["/v1/evaluate"]["post"].is_object());
     assert!(schema["paths"]["/v1/workers/{worker_id}/heartbeat"]["post"].is_object());
+    assert!(schema["paths"]["/v1/workers/{worker_id}/complete-and-claim"]["post"].is_object());
     assert!(schema["components"]["schemas"]["Outcome"].is_object());
     assert!(schema["components"]["schemas"]["SearchLimit"].is_object());
     assert!(schema["components"]["securitySchemes"]["client_key"].is_object());
