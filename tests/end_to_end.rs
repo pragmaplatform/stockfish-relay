@@ -149,6 +149,7 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
         );
         let body = response.text().await.unwrap();
         assert!(body.contains("No workers connected"));
+        assert!(body.contains(&format!("Master version: {}", env!("CARGO_PKG_VERSION"))));
         assert!(body.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
         assert!(!body.contains(PASSWORD));
         assert!(!body.contains(API_KEY));
@@ -191,6 +192,8 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
         .unwrap();
     assert!(body.contains("&lt;script&gt;alert(&#39;worker&#39;)&lt;/script&gt;"));
     assert!(body.contains("Stockfish &lt;19&gt; &amp; &quot;test&quot;"));
+    assert!(body.contains("<td>Unknown</td>"));
+    assert!(server.status().await.workers[0].relay_version.is_none());
     assert!(!body.contains("<script>"));
     assert!(body.contains(&session.worker_id.to_string()));
     assert!(body.contains("<td>0 / 3</td><td>2</td><td>128 MB</td>"));
@@ -227,7 +230,7 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
         .unwrap();
     let body = server
         .client
-        .get(url)
+        .get(&url)
         .basic_auth("admin", Some(PASSWORD))
         .send()
         .await
@@ -236,6 +239,34 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
         .await
         .unwrap();
     assert!(body.contains("No workers connected"));
+
+    // Version metadata is optional and must be escaped like other worker input.
+    server
+        .client
+        .post(format!("{}v1/workers/register", server.origin))
+        .bearer_auth(WORKER_KEY)
+        .header("User-Agent", "stockfish-relay/0.2.0-<test>")
+        .json(&registration)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let status = server.status().await;
+    assert_eq!(status.relay_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(status.workers[0].relay_version.as_deref(), Some("0.2.0-<test>"));
+    let body = server
+        .client
+        .get(url)
+        .basic_auth("admin", Some(PASSWORD))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("<td>0.2.0-&lt;test&gt;</td>"));
+    assert!(!body.contains("0.2.0-<test>"));
     server.stop().await;
 }
 
@@ -476,6 +507,10 @@ async fn exercise_worker_transport(legacy: bool, latency: Duration, jobs: usize)
     let shutdown = stop.clone();
     let task = tokio::spawn(async move { worker::run(config, shutdown).await });
     server.wait_workers(1).await;
+    assert_eq!(
+        server.status().await.workers[0].relay_version.as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
     let started = std::time::Instant::now();
     let mut calls = tokio::task::JoinSet::new();
     for _ in 0..jobs {

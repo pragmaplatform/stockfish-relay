@@ -159,6 +159,8 @@ pub struct Completion {
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 pub struct Status {
+    /// Relay package version running on the master.
+    pub relay_version: String,
     /// Elapsed seconds since the master started; resets on restart.
     pub uptime_seconds: u64,
     pub queued_interactive: usize,
@@ -174,6 +176,8 @@ pub struct Status {
 pub struct WorkerStatus {
     pub id: Uuid,
     pub name: String,
+    /// Relay package version reported by the worker's User-Agent, if available.
+    pub relay_version: Option<String>,
     /// Elapsed seconds since this worker registered; resets on reconnection.
     pub uptime_seconds: u64,
     pub capacity: u16,

@@ -109,13 +109,16 @@ master, then open `/admin` on its existing HTTP address. The browser prompts for
 these separate HTTP Basic Auth credentials. Serve it through the same HTTPS
 reverse proxy used for the API when accessing it remotely.
 
-The read-only page reloads every five seconds and shows master uptime, connected
-workers and their uptime, engine names, running/available slots, configured threads
-and hash memory per engine, interactive/batch queue sizes, and
+The read-only page reloads every five seconds and shows the relay package version
+and uptime for the master and each connected worker, engine names, running/available
+slots, configured threads and hash memory per engine, interactive/batch queue sizes, and
 completed/retried/failed totals. Master uptime and totals reset when the master
 restarts. Worker uptime measures time since registration and resets on each new
 connection; disconnected workers disappear. There is no historical storage or
-collection of actual CPU/RAM usage.
+collection of actual CPU/RAM usage. Worker versions come from the
+`stockfish-relay/<version>` User-Agent sent at registration; workers without this
+header show "Unknown". Both master and worker log their relay package version
+at startup.
 
 The dashboard is disabled (404) when both settings are absent. Setting only one
 is a configuration error. The username must be printable non-space ASCII without
