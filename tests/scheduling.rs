@@ -71,7 +71,7 @@ fn success(assignment: &Assignment) -> Completion {
 #[tokio::test(start_paused = true)]
 async fn complete_and_claim_publishes_before_waiting_and_rejects_stale_completions() {
     let master = Master::new(config()).unwrap();
-    let session = master.register(worker()).await.unwrap();
+    let session = master.register(worker(), None).await.unwrap();
     assert!(session.complete_and_claim);
     let first = submit(&master, EvaluateRequest::default()).await;
     let assignment = master.claim(session.worker_id).await.unwrap().unwrap();
@@ -112,8 +112,8 @@ async fn complete_and_claim_publishes_before_waiting_and_rejects_stale_completio
 #[tokio::test(start_paused = true)]
 async fn disconnected_worker_retries_the_same_request_and_rejects_late_results() {
     let master = Master::new(config()).unwrap();
-    let disconnected = master.register(worker()).await.unwrap();
-    let healthy = master.register(worker()).await.unwrap();
+    let disconnected = master.register(worker(), None).await.unwrap();
+    let healthy = master.register(worker(), None).await.unwrap();
     let response = submit(&master, EvaluateRequest::default()).await;
     let first = master.claim(disconnected.worker_id).await.unwrap().unwrap();
     tokio::time::advance(Duration::from_millis(700)).await;
@@ -148,7 +148,7 @@ async fn disconnected_worker_retries_the_same_request_and_rejects_late_results()
 #[tokio::test(start_paused = true)]
 async fn worker_errors_retry_immediately_and_duplicate_completions_cannot_finish_another_attempt() {
     let master = Master::new(config()).unwrap();
-    let worker = master.register(worker()).await.unwrap();
+    let worker = master.register(worker(), None).await.unwrap();
     let response = submit(&master, EvaluateRequest::default()).await;
     let first = master.claim(worker.worker_id).await.unwrap().unwrap();
     master
@@ -187,7 +187,7 @@ async fn worker_errors_retry_immediately_and_duplicate_completions_cannot_finish
 #[tokio::test(start_paused = true)]
 async fn only_acknowledged_assignments_are_renewed_by_heartbeats() {
     let master = Master::new(config()).unwrap();
-    let worker = master.register(worker()).await.unwrap();
+    let worker = master.register(worker(), None).await.unwrap();
     let response = submit(&master, EvaluateRequest::default()).await;
     let lost_delivery = master.claim(worker.worker_id).await.unwrap().unwrap();
     tokio::time::advance(Duration::from_millis(700)).await;
@@ -240,7 +240,7 @@ async fn repeated_worker_failure_is_bounded_by_the_attempt_limit() {
     let mut config = config();
     config.max_attempts = 2;
     let master = Master::new(config).unwrap();
-    let worker = master.register(worker()).await.unwrap();
+    let worker = master.register(worker(), None).await.unwrap();
     let response = submit(&master, EvaluateRequest::default()).await;
     for _ in 0..2 {
         let job = master.claim(worker.worker_id).await.unwrap().unwrap();
@@ -268,8 +268,8 @@ async fn repeated_worker_failure_is_bounded_by_the_attempt_limit() {
 #[tokio::test(start_paused = true)]
 async fn graceful_worker_departure_requeues_without_waiting_for_the_lease() {
     let master = Master::new(config()).unwrap();
-    let departing = master.register(worker()).await.unwrap();
-    let healthy = master.register(worker()).await.unwrap();
+    let departing = master.register(worker(), None).await.unwrap();
+    let healthy = master.register(worker(), None).await.unwrap();
     let response = submit(&master, EvaluateRequest::default()).await;
     let first = master.claim(departing.worker_id).await.unwrap().unwrap();
     master.unregister(departing.worker_id).await.unwrap();
@@ -288,7 +288,7 @@ async fn queue_capacity_and_worker_capacity_are_enforced() {
         master.evaluate(EvaluateRequest::default()).await.unwrap_err().status,
         StatusCode::SERVICE_UNAVAILABLE
     );
-    let worker = master.register(worker()).await.unwrap();
+    let worker = master.register(worker(), None).await.unwrap();
     let response = submit(&master, EvaluateRequest::default()).await;
     let job = master.claim(worker.worker_id).await.unwrap().unwrap();
     assert_eq!(
@@ -306,7 +306,7 @@ async fn queue_capacity_and_worker_capacity_are_enforced() {
 #[tokio::test(start_paused = true)]
 async fn interactive_jobs_run_first_without_starving_batch_work() {
     let master = Master::new(config()).unwrap();
-    let worker = master.register(worker()).await.unwrap();
+    let worker = master.register(worker(), None).await.unwrap();
     let batch = submit(&master, EvaluateRequest::default()).await;
     let mut interactive = vec![];
     for _ in 0..9 {
@@ -342,7 +342,7 @@ async fn interactive_jobs_run_first_without_starving_batch_work() {
 #[tokio::test(start_paused = true)]
 async fn cancelled_callers_and_master_shutdown_release_waiting_requests() {
     let master = Master::new(config()).unwrap();
-    let worker = master.register(worker()).await.unwrap();
+    let worker = master.register(worker(), None).await.unwrap();
     let abandoned = submit(&master, EvaluateRequest::default()).await;
     let job = master.claim(worker.worker_id).await.unwrap().unwrap();
     abandoned.abort();
@@ -372,7 +372,7 @@ async fn retries_cannot_extend_the_original_request_deadline() {
     config.request_timeout_ms = 1000;
     config.search_timeout_ms = 500;
     let master = Master::new(config).unwrap();
-    let worker = master.register(worker()).await.unwrap();
+    let worker = master.register(worker(), None).await.unwrap();
     let response = submit(&master, EvaluateRequest::default()).await;
     master.claim(worker.worker_id).await.unwrap().unwrap();
     tokio::time::advance(Duration::from_millis(1001)).await;
@@ -383,7 +383,7 @@ async fn retries_cannot_extend_the_original_request_deadline() {
 #[tokio::test(start_paused = true)]
 async fn engine_requirements_route_only_to_matching_workers() {
     let master = Master::new(config()).unwrap();
-    let wrong = master.register(worker()).await.unwrap();
+    let wrong = master.register(worker(), None).await.unwrap();
     let request = EvaluateRequest {
         engine: Some("Stockfish required".into()),
         ..Default::default()
@@ -394,7 +394,7 @@ async fn engine_requirements_route_only_to_matching_workers() {
     );
     let mut registration = worker();
     registration.engine.name = "Stockfish required".into();
-    let matching = master.register(registration).await.unwrap();
+    let matching = master.register(registration, None).await.unwrap();
     let response = submit(&master, request).await;
     assert!(master.claim(wrong.worker_id).await.unwrap().is_none());
     let job = master.claim(matching.worker_id).await.unwrap().unwrap();

@@ -25,7 +25,7 @@ async fn main() -> Result<(), Error> {
         Command::Master(config) => {
             config.validate()?;
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
-            tracing::info!(address = %listener.local_addr()?, "Stockfish Relay master listening");
+            tracing::info!(version = env!("CARGO_PKG_VERSION"), address = %listener.local_addr()?, "Stockfish Relay master listening");
             master::serve(listener, config, shutdown).await
         }
         Command::Worker(config) => worker::run(config, shutdown).await,

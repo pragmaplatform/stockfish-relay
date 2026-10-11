@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Path, Request, State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -121,9 +121,16 @@ async fn status(State(master): State<Master>) -> Json<Status> {
 #[utoipa::path(post, path = "/v1/workers/register", tag = "Workers", request_body = RegisterWorker, security(("worker_key" = [])), responses((status = 200, body = WorkerSession), (status = 400, body = ErrorBody), (status = 401, body = ErrorBody)))]
 async fn register(
     State(master): State<Master>,
+    headers: HeaderMap,
     body: Result<Json<RegisterWorker>, JsonRejection>,
 ) -> Result<Json<WorkerSession>, ApiError> {
-    Ok(Json(master.register(payload(body)?).await?))
+    let relay_version = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("stockfish-relay/"))
+        .filter(|value| !value.is_empty() && value.len() <= 128)
+        .map(str::to_owned);
+    Ok(Json(master.register(payload(body)?, relay_version).await?))
 }
 
 #[utoipa::path(post, path = "/v1/workers/{worker_id}/claim", tag = "Workers", params(("worker_id" = Uuid, Path)), security(("worker_key" = [])), responses((status = 200, body = Assignment), (status = 204, description = "No compatible work within the long-poll interval"), (status = 404, body = ErrorBody), (status = 409, body = ErrorBody)))]

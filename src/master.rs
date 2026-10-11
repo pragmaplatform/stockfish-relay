@@ -57,6 +57,7 @@ struct Lease {
 
 struct Worker {
     registration: RegisterWorker,
+    relay_version: Option<String>,
     connected_at: Instant,
     seen: Instant,
 }
@@ -149,7 +150,11 @@ impl Master {
         result
     }
 
-    pub async fn register(&self, registration: RegisterWorker) -> Result<WorkerSession, ApiError> {
+    pub async fn register(
+        &self,
+        registration: RegisterWorker,
+        relay_version: Option<String>,
+    ) -> Result<WorkerSession, ApiError> {
         if registration.protocol_version != PROTOCOL_VERSION {
             return Err(ApiError::invalid("Unsupported worker protocol version"));
         }
@@ -175,6 +180,7 @@ impl Master {
             worker_id,
             Worker {
                 registration,
+                relay_version,
                 connected_at,
                 seen: connected_at,
             },
@@ -356,6 +362,7 @@ impl Master {
         let mut state = self.state.lock().await;
         state.maintain(&self.config);
         Status {
+            relay_version: env!("CARGO_PKG_VERSION").into(),
             uptime_seconds: self.started_at.elapsed().as_secs(),
             queued_interactive: state.interactive.len(),
             queued_batch: state.batch.len(),
@@ -369,6 +376,7 @@ impl Master {
                 .map(|(id, worker)| WorkerStatus {
                     id: *id,
                     name: worker.registration.name.clone(),
+                    relay_version: worker.relay_version.clone(),
                     uptime_seconds: worker.connected_at.elapsed().as_secs(),
                     capacity: worker.registration.capacity,
                     running: state.running(*id),

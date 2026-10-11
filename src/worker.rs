@@ -21,6 +21,7 @@ struct Session {
 
 pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> Result<(), Error> {
     config.validate()?;
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), name = %config.name, "Stockfish Relay worker starting");
     let mut headers = HeaderMap::new();
     let mut authorization = HeaderValue::from_str(&format!("Bearer {}", config.worker_key))
         .map_err(|_| Error::Configuration("Invalid worker key".into()))?;
