@@ -4,6 +4,13 @@ User-facing changes to Stockfish Relay, newest first. Historical entries are
 backfilled from Git history and grouped by package version in `Cargo.toml`;
 dates come from that history.
 
+## 0.3.3 - 2026-10-12
+
+### Changed
+
+- The admin dashboard uses the available screen width so wide tables can fit on
+  desktop displays. Tables remain horizontally scrollable on smaller screens.
+
 ## 0.3.2 - 2026-10-12
 
 ### Added
