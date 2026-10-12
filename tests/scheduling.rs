@@ -68,6 +68,141 @@ fn success(assignment: &Assignment) -> Completion {
     }
 }
 
+fn assert_timing(metric: &Option<TimingMetric>, expected: f64) {
+    let metric = metric.as_ref().unwrap();
+    assert!((metric.average_ms - expected).abs() < 1e-9);
+    assert!((metric.p95_ms - expected).abs() < 1e-9);
+}
+
+#[tokio::test(start_paused = true)]
+async fn job_timings_measure_queue_execution_overhead_and_retries_without_counting_stale_results() {
+    let master = Master::new(config()).unwrap();
+    let first_worker = master.register(worker(), None).await.unwrap();
+    let second_worker = master.register(worker(), None).await.unwrap();
+    let response = submit(&master, EvaluateRequest::default()).await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let first = master.claim(first_worker.worker_id).await.unwrap().unwrap();
+    tokio::time::advance(Duration::from_millis(20)).await;
+    master.complete(first_worker.worker_id, success(&first)).await.unwrap();
+    response.await.unwrap().unwrap();
+    let status = master.status().await;
+    let summary = &status.timings.first_attempt;
+    assert_eq!(summary.samples, 1);
+    assert_timing(&summary.queue_wait, 10.0);
+    assert_timing(&summary.engine, 5.0);
+    assert_timing(&summary.overhead, 15.0);
+    assert_timing(&summary.total, 30.0);
+
+    let response = submit(&master, EvaluateRequest::default()).await;
+    tokio::time::advance(Duration::from_millis(7)).await;
+    let failed = master.claim(first_worker.worker_id).await.unwrap().unwrap();
+    tokio::time::advance(Duration::from_millis(40)).await;
+    master
+        .complete(
+            first_worker.worker_id,
+            Completion {
+                assignment: failed.id,
+                outcome: Outcome::Failed {
+                    error: "engine exited".into(),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_millis(11)).await;
+    let retry = master.claim(second_worker.worker_id).await.unwrap().unwrap();
+    tokio::time::advance(Duration::from_millis(25)).await;
+    assert!(master.complete(first_worker.worker_id, success(&failed)).await.is_err());
+    let mut invalid = success(&retry);
+    if let Outcome::Succeeded { result } = &mut invalid.outcome {
+        result.engine.name = "wrong engine".into();
+    }
+    assert!(master.complete(second_worker.worker_id, invalid).await.is_err());
+    assert_eq!(master.status().await.timings.retried.samples, 0);
+    master.complete(second_worker.worker_id, success(&retry)).await.unwrap();
+    response.await.unwrap().unwrap();
+    assert!(master.complete(second_worker.worker_id, success(&retry)).await.is_err());
+    let status = master.status().await;
+    assert_eq!(status.timings.first_attempt.samples, 1);
+    let summary = &status.timings.retried;
+    assert_eq!(summary.samples, 1);
+    assert_timing(&summary.queue_wait, 18.0);
+    assert_timing(&summary.engine, 5.0);
+    assert_timing(&summary.overhead, 20.0);
+    assert_timing(&summary.total, 83.0);
+    let first_stats = status.workers.iter().find(|w| w.id == first_worker.worker_id).unwrap();
+    let second_stats = status.workers.iter().find(|w| w.id == second_worker.worker_id).unwrap();
+    assert_eq!(first_stats.timings.first_attempt.samples, 1);
+    assert_eq!(first_stats.timings.retried.samples, 0);
+    assert_eq!(second_stats.timings.first_attempt.samples, 0);
+    assert_eq!(second_stats.timings.retried.samples, 1);
+
+    master.unregister(first_worker.worker_id).await.unwrap();
+    let fresh = master.register(worker(), None).await.unwrap();
+    let status = master.status().await;
+    assert_eq!(status.timings.first_attempt.samples, 1);
+    assert_eq!(
+        status
+            .workers
+            .iter()
+            .find(|w| w.id == fresh.worker_id)
+            .unwrap()
+            .timings
+            .first_attempt
+            .samples,
+        0
+    );
+    assert!(
+        Master::new(config())
+            .unwrap()
+            .status()
+            .await
+            .timings
+            .first_attempt
+            .total
+            .is_none()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn heartbeat_rtt_is_optional_validated_and_scoped_to_worker_sessions() {
+    let master = Master::new(config()).unwrap();
+    let session = master.register(worker(), None).await.unwrap();
+    let legacy: Heartbeat = serde_json::from_str(r#"{"assignments":[]}"#).unwrap();
+    master.heartbeat(session.worker_id, legacy).await.unwrap();
+    assert!(master.status().await.workers[0].heartbeat_rtt.is_none());
+    for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            master
+                .heartbeat(
+                    session.worker_id,
+                    Heartbeat {
+                        round_trip_ms: Some(invalid),
+                        ..Heartbeat::default()
+                    }
+                )
+                .await
+                .is_err()
+        );
+    }
+    master
+        .heartbeat(
+            session.worker_id,
+            Heartbeat {
+                round_trip_ms: Some(12.5),
+                ..Heartbeat::default()
+            },
+        )
+        .await
+        .unwrap();
+    let status = master.status().await;
+    assert_eq!(status.workers[0].heartbeat_rtt_samples, 1);
+    assert_timing(&status.workers[0].heartbeat_rtt, 12.5);
+    master.unregister(session.worker_id).await.unwrap();
+    master.register(worker(), None).await.unwrap();
+    assert_eq!(master.status().await.workers[0].heartbeat_rtt_samples, 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn complete_and_claim_publishes_before_waiting_and_rejects_stale_completions() {
     let master = Master::new(config()).unwrap();
@@ -117,10 +252,7 @@ async fn disconnected_worker_retries_the_same_request_and_rejects_late_results()
     let response = submit(&master, EvaluateRequest::default()).await;
     let first = master.claim(disconnected.worker_id).await.unwrap().unwrap();
     tokio::time::advance(Duration::from_millis(700)).await;
-    master
-        .heartbeat(healthy.worker_id, Heartbeat { assignments: vec![] })
-        .await
-        .unwrap();
+    master.heartbeat(healthy.worker_id, Heartbeat::default()).await.unwrap();
     tokio::time::advance(Duration::from_millis(400)).await;
     let retry = master.claim(healthy.worker_id).await.unwrap().unwrap();
     assert_eq!(first.id.job_id, retry.id.job_id);
@@ -191,10 +323,7 @@ async fn only_acknowledged_assignments_are_renewed_by_heartbeats() {
     let response = submit(&master, EvaluateRequest::default()).await;
     let lost_delivery = master.claim(worker.worker_id).await.unwrap().unwrap();
     tokio::time::advance(Duration::from_millis(700)).await;
-    master
-        .heartbeat(worker.worker_id, Heartbeat { assignments: vec![] })
-        .await
-        .unwrap();
+    master.heartbeat(worker.worker_id, Heartbeat::default()).await.unwrap();
     tokio::time::advance(Duration::from_millis(400)).await;
     let retry = master.claim(worker.worker_id).await.unwrap().unwrap();
     assert_eq!(retry.attempt, 2);
@@ -202,6 +331,7 @@ async fn only_acknowledged_assignments_are_renewed_by_heartbeats() {
         .heartbeat(
             worker.worker_id,
             Heartbeat {
+                round_trip_ms: None,
                 assignments: vec![retry.id],
             },
         )
@@ -213,6 +343,7 @@ async fn only_acknowledged_assignments_are_renewed_by_heartbeats() {
             .heartbeat(
                 worker.worker_id,
                 Heartbeat {
+                    round_trip_ms: None,
                     assignments: vec![lost_delivery.id],
                 },
             )
@@ -223,6 +354,7 @@ async fn only_acknowledged_assignments_are_renewed_by_heartbeats() {
             .heartbeat(
                 worker.worker_id,
                 Heartbeat {
+                    round_trip_ms: None,
                     assignments: vec![retry.id],
                 },
             )
@@ -351,6 +483,7 @@ async fn cancelled_callers_and_master_shutdown_release_waiting_requests() {
         .heartbeat(
             worker.worker_id,
             Heartbeat {
+                round_trip_ms: None,
                 assignments: vec![job.id],
             },
         )

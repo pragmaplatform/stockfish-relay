@@ -4,6 +4,18 @@ User-facing changes to Stockfish Relay, newest first. Historical entries are
 backfilled from Git history and grouped by package version in `Cargo.toml`;
 dates come from that history.
 
+## 0.3.2 - 2026-10-12
+
+### Added
+
+- Average/p95 queue wait, engine execution, dispatch/result overhead, and total
+  job time in the dashboard and `/v1/status`, using a rolling window of the latest
+  1,000 successful completions. First-attempt and retried jobs are summarized
+  separately, with sample counts and per-worker execution/overhead statistics.
+- Per-worker heartbeat round-trip time, measured without extra requests and
+  summarized over the latest 1,000 reported successful heartbeats per session.
+  Older workers remain compatible and show no RTT data until upgraded.
+
 ## 0.3.1 - 2026-10-11
 
 ### Added

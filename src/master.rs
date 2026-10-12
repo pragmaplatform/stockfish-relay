@@ -17,6 +17,7 @@ use crate::{
     config::MasterConfig,
     error::{ApiError, Error},
     protocol::*,
+    timings::{RoundTrips, Sample, Timings},
 };
 
 #[derive(Clone)]
@@ -37,6 +38,7 @@ struct State {
     completed: u64,
     retried: u64,
     failed: u64,
+    timings: Timings,
     closed: bool,
 }
 
@@ -44,6 +46,9 @@ struct Job {
     request: EvaluateRequest,
     reply: oneshot::Sender<Result<EvaluateResponse, ApiError>>,
     deadline: Instant,
+    accepted_at: Instant,
+    queued_at: Instant,
+    queue_wait: Duration,
     attempts: u32,
     lease: Option<Lease>,
 }
@@ -53,6 +58,7 @@ struct Lease {
     worker_id: Uuid,
     expires: Instant,
     deadline: Instant,
+    assigned_at: Instant,
 }
 
 struct Worker {
@@ -60,6 +66,7 @@ struct Worker {
     relay_version: Option<String>,
     connected_at: Instant,
     seen: Instant,
+    round_trips: RoundTrips,
 }
 
 pub async fn serve(listener: TcpListener, config: MasterConfig, shutdown: CancellationToken) -> Result<(), Error> {
@@ -123,12 +130,16 @@ impl Master {
                 ));
             }
             state.enqueue(job_id, request.priority);
+            let accepted_at = Instant::now();
             state.jobs.insert(
                 job_id,
                 Job {
                     request,
                     reply: sender,
                     deadline,
+                    accepted_at,
+                    queued_at: accepted_at,
+                    queue_wait: Duration::ZERO,
                     attempts: 0,
                     lease: None,
                 },
@@ -183,6 +194,7 @@ impl Master {
                 relay_version,
                 connected_at,
                 seen: connected_at,
+                round_trips: RoundTrips::default(),
             },
         );
         drop(state);
@@ -238,12 +250,14 @@ impl Master {
                 if let Some(job_id) = selected {
                     let job = state.jobs.get_mut(&job_id).ok_or_else(ApiError::stale)?;
                     let now = Instant::now();
+                    job.queue_wait += now.duration_since(job.queued_at);
                     let id = AssignmentId {
                         job_id,
                         attempt_id: Uuid::new_v4(),
                     };
                     job.attempts += 1;
                     job.lease = Some(Lease {
+                        assigned_at: now,
                         id,
                         worker_id,
                         expires: now + Duration::from_millis(self.config.lease_ms),
@@ -270,6 +284,14 @@ impl Master {
         let worker = state.workers.get_mut(&worker_id).ok_or_else(ApiError::unknown_worker)?;
         if heartbeat.assignments.len() > usize::from(worker.registration.capacity) {
             return Err(ApiError::invalid("Heartbeat exceeds worker capacity"));
+        }
+        if let Some(milliseconds) = heartbeat.round_trip_ms {
+            if !milliseconds.is_finite() || milliseconds < 0.0 {
+                return Err(ApiError::invalid(
+                    "Heartbeat round-trip time must be finite and nonnegative",
+                ));
+            }
+            worker.round_trips.record(milliseconds);
         }
         let now = Instant::now();
         worker.seen = now;
@@ -305,8 +327,21 @@ impl Master {
             Outcome::Succeeded { result } => {
                 let worker = state.workers.get(&worker_id).ok_or_else(ApiError::unknown_worker)?;
                 result.validate(&job.request, &worker.registration.engine)?;
+                let now = Instant::now();
+                let engine = Duration::from_millis(result.elapsed_ms);
+                let sample = Sample {
+                    worker_id,
+                    retried: job.attempts > 1,
+                    queue_wait: job.queue_wait,
+                    engine,
+                    overhead: now
+                        .duration_since(job.lease.as_ref().ok_or_else(ApiError::stale)?.assigned_at)
+                        .saturating_sub(engine),
+                    total: now.duration_since(job.accepted_at),
+                };
                 let id = completion.assignment.job_id;
                 let job = state.jobs.remove(&id).ok_or_else(ApiError::stale)?;
+                state.timings.record(sample);
                 state.completed += 1;
                 let _ = job.reply.send(Ok(EvaluateResponse {
                     job_id: id,
@@ -370,6 +405,7 @@ impl Master {
             completed: state.completed,
             retried: state.retried,
             failed: state.failed,
+            timings: state.timings.summary(None),
             workers: state
                 .workers
                 .iter()
@@ -381,6 +417,9 @@ impl Master {
                     capacity: worker.registration.capacity,
                     running: state.running(*id),
                     engine: worker.registration.engine.clone(),
+                    timings: state.timings.summary(Some(*id)),
+                    heartbeat_rtt: worker.round_trips.summary(),
+                    heartbeat_rtt_samples: worker.round_trips.len(),
                 })
                 .collect(),
         }
@@ -464,6 +503,7 @@ impl State {
             }
         } else {
             job.lease = None;
+            job.queued_at = Instant::now();
             let priority = job.request.priority;
             tracing::warn!(job_id = %id, attempts = job.attempts, %reason, "Requeuing evaluation");
             self.retried += 1;

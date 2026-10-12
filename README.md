@@ -116,11 +116,43 @@ and uptime for the master and each connected worker, engine names, running/avail
 slots, configured threads and hash memory per engine, interactive/batch queue sizes, and
 completed/retried/failed totals. Master uptime and totals reset when the master
 restarts. Worker uptime measures time since registration and resets on each new
-connection; disconnected workers disappear. There is no historical storage or
+connection; disconnected workers disappear. There is no persistent historical storage or
 collection of actual CPU/RAM usage. Worker versions come from the
 `stockfish-relay/<version>` User-Agent sent at registration; workers without this
 header show "Unknown". Both master and worker log their relay package version
 at startup.
+
+The dashboard also shows average and p95 timings in milliseconds over the latest
+1,000 successfully completed jobs. First-attempt completions and completions after
+retries have separate sample counts and summaries. Failed and unfinished jobs are
+excluded. The p95 uses the nearest-rank method; an empty group shows `—`, not zero.
+
+- **Queue wait:** all time spent queued across the job's attempts.
+- **Engine time:** worker-reported execution time for the successful attempt.
+- **Dispatch/result overhead:** successful assignment-to-completion time minus
+  engine time, clamped to zero. This includes network travel, serialization,
+  worker scheduling, and engine startup when needed; it is not pure network latency.
+- **Total job time:** acceptance by the master to successful completion, including
+  earlier attempts and queue waits. Travel between the API client and master is excluded.
+
+The worker timing table shows execution and overhead for each connected session's
+completions in that same shared window. Disconnected workers' samples remain in
+the overall summary until evicted; a new worker session starts with no samples.
+Timing history is bounded, held in memory, and resets on master restart. These
+summaries are also available in `/v1/status` under `timings` and each worker's
+`timings`; empty metric values are `null`. Durations use local monotonic clocks,
+so master and worker wall clocks need not be synchronized. For retried jobs,
+queue, engine, and overhead averages do not sum to total time because unsuccessful
+attempt execution is included only in the total. Percentiles are not additive.
+
+Each worker also shows **Heartbeat RTT** (average/p95 and sample count), measured
+from sending a heartbeat request to reading its response on that worker. This is
+an application-level round trip: it includes HTTP handling but no job execution
+or long-poll wait. Workers report the previous successful measurement with their
+next heartbeat, requiring no extra requests. The separate per-session window
+holds the latest 1,000 reported successful round trips and resets on reconnect.
+Older workers remain compatible and show no RTT data until upgraded. In
+`/v1/status`, these are `heartbeat_rtt` and `heartbeat_rtt_samples` on each worker.
 
 The dashboard is disabled (404) when both settings are absent. Setting only one
 is a configuration error. The username must be printable non-space ASCII without
@@ -233,7 +265,7 @@ GitHub Actions publishes the `linux/amd64` image to
 `ghcr.io/pragmaplatform/stockfish-relay` after all CI checks pass:
 
 - Pushes to the default branch (`main`) publish the package version from
-  `Cargo.toml` (currently `0.3.0`), `latest`, and `sha-<full-commit-sha>`.
+  `Cargo.toml` (currently `0.3.2`), `latest`, and `sha-<full-commit-sha>`.
   The package-version tag updates on each successful main build until the version
   changes; use the commit tag or image digest to pin a specific build.
 - Version tag pushes such as `v1.2.3` publish `1.2.3`. Prerelease tags such as

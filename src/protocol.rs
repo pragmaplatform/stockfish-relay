@@ -134,9 +134,12 @@ pub struct Assignment {
     pub search_timeout_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Serialize, ToSchema)]
+#[derive(Debug, Default, Deserialize, Serialize, ToSchema)]
 pub struct Heartbeat {
     pub assignments: Vec<AssignmentId>,
+    /// Previous successful heartbeat's request/response duration, measured on the worker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_trip_ms: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
@@ -169,6 +172,8 @@ pub struct Status {
     pub completed: u64,
     pub retried: u64,
     pub failed: u64,
+    /// Timings from the latest 1,000 successfully completed jobs, reset on master restart.
+    pub timings: JobTimings,
     pub workers: Vec<WorkerStatus>,
 }
 
@@ -183,6 +188,37 @@ pub struct WorkerStatus {
     pub capacity: u16,
     pub running: usize,
     pub engine: EngineInfo,
+    /// Jobs completed by this session within the master's shared timing window.
+    pub timings: JobTimings,
+    /// Latest 1,000 successful heartbeat round trips reported by this worker session.
+    pub heartbeat_rtt: Option<TimingMetric>,
+    pub heartbeat_rtt_samples: usize,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct JobTimings {
+    pub first_attempt: TimingSummary,
+    pub retried: TimingSummary,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, ToSchema)]
+pub struct TimingSummary {
+    pub samples: usize,
+    /// Sum of queue waits across all attempts.
+    pub queue_wait: Option<TimingMetric>,
+    /// Worker-reported engine time for the successful attempt only.
+    pub engine: Option<TimingMetric>,
+    /// Successful assignment duration minus engine time, clamped to zero; not pure network latency.
+    pub overhead: Option<TimingMetric>,
+    /// Master acceptance to successful completion, including earlier attempts and queue waits.
+    pub total: Option<TimingMetric>,
+}
+
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct TimingMetric {
+    pub average_ms: f64,
+    /// Nearest-rank 95th percentile; null metrics indicate no samples.
+    pub p95_ms: f64,
 }
 
 impl EvaluateRequest {
