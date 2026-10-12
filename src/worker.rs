@@ -174,18 +174,21 @@ impl Session {
     async fn heartbeat_loop(&self) -> Result<(), Error> {
         let mut tick = tokio::time::interval(Duration::from_millis(self.registration.heartbeat_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut round_trip_ms = None;
         loop {
             tokio::select! {
                 _ = self.stop.cancelled() => return Ok(()),
                 _ = tick.tick() => {},
             }
             let assignments = self.active.lock().await.keys().copied().collect();
+            let started = tokio::time::Instant::now();
             let response = tokio::select! {
                 _ = self.stop.cancelled() => return Ok(()),
                 response = self.client.post(self.endpoint("heartbeat")).timeout(self.network_timeout())
-                    .json(&Heartbeat { assignments }).send() => response?,
+                    .json(&Heartbeat { assignments, round_trip_ms }).send() => response?,
             };
             let heartbeat: HeartbeatResponse = response.error_for_status()?.json().await?;
+            round_trip_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
             let active = self.active.lock().await;
             for id in heartbeat.cancelled {
                 if let Some(stop) = active.get(&id) {

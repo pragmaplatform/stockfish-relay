@@ -149,6 +149,8 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
         );
         let body = response.text().await.unwrap();
         assert!(body.contains("No workers connected"));
+        assert!(body.contains("First attempt (samples: 0)"));
+        assert!(body.contains("<td>—</td>"));
         assert!(body.contains(&format!("Master version: {}", env!("CARGO_PKG_VERSION"))));
         assert!(body.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
         assert!(!body.contains(PASSWORD));
@@ -180,6 +182,19 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
         .await
         .unwrap();
     let url = format!("{}admin", server.origin);
+    server
+        .client
+        .post(format!("{}v1/workers/{}/heartbeat", server.origin, session.worker_id))
+        .bearer_auth(WORKER_KEY)
+        .json(&Heartbeat {
+            round_trip_ms: Some(12.5),
+            ..Heartbeat::default()
+        })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let body = server
         .client
         .get(&url)
@@ -197,6 +212,8 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
     assert!(!body.contains("<script>"));
     assert!(body.contains(&session.worker_id.to_string()));
     assert!(body.contains("<td>0 / 3</td><td>2</td><td>128 MB</td>"));
+    assert!(body.contains("Heartbeat RTT"));
+    assert!(body.contains("12.5 / 12.5<small>Samples: 1</small>"));
     assert!(body.contains("Engine slots</h2><p class=\"value\">3</p>"));
     assert!(!body.contains("No workers connected"));
 
@@ -257,7 +274,7 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
     assert_eq!(status.workers[0].relay_version.as_deref(), Some("0.2.0-<test>"));
     let body = server
         .client
-        .get(url)
+        .get(&url)
         .basic_auth("admin", Some(PASSWORD))
         .send()
         .await
@@ -267,6 +284,35 @@ async fn admin_dashboard_requires_separate_credentials_and_renders_live_workers_
         .unwrap();
     assert!(body.contains("<td>0.2.0-&lt;test&gt;</td>"));
     assert!(!body.contains("0.2.0-<test>"));
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = fixture(dir.path(), true);
+    let (stop, task) = start_worker(&server, &engine);
+    server.wait_workers(2).await;
+    assert_eq!(evaluate(&server).await.attempts, 2);
+    assert_eq!(evaluate(&server).await.attempts, 1);
+    let status = server.status().await;
+    assert_eq!(status.timings.first_attempt.samples, 1);
+    assert_eq!(status.timings.retried.samples, 1);
+    let body = server
+        .client
+        .get(&url)
+        .basic_auth("admin", Some(PASSWORD))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("First attempt (samples: 1)"));
+    assert!(body.contains("After retries (samples: 1)"));
+    for metric in [status.timings.first_attempt.engine, status.timings.retried.engine] {
+        let metric = metric.unwrap();
+        assert!(body.contains(&format!("<td>{:.1} / {:.1}</td>", metric.average_ms, metric.p95_ms)));
+    }
+    assert!(body.contains("Worker timings"));
+    assert!(body.contains("not pure network latency"));
+    stop_worker(stop, task).await;
     server.stop().await;
 }
 
@@ -442,6 +488,11 @@ async fn worker_negotiates_complete_and_claim_and_supports_legacy_masters() {
 }
 
 #[tokio::test]
+async fn worker_reports_heartbeat_round_trip_including_both_network_directions() {
+    exercise_worker_transport(false, Duration::from_millis(20), 1).await;
+}
+
+#[tokio::test]
 #[ignore = "Manual transport benchmark with 50 ms simulated worker round-trip latency"]
 async fn worker_transport_latency_benchmark() {
     for legacy in [true, false] {
@@ -535,6 +586,19 @@ async fn exercise_worker_transport(legacy: bool, latency: Duration, jobs: usize)
         assert_eq!(response.unwrap().attempts, 1);
     }
     let elapsed = started.elapsed();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let status = server.status().await;
+            if let Some(rtt) = &status.workers[0].heartbeat_rtt {
+                assert!(status.workers[0].heartbeat_rtt_samples > 0);
+                assert!(rtt.average_ms >= latency.as_secs_f64() * 2000.0);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
     let counts = counts.lock().await;
     assert_eq!(
         counts.get("complete").copied().unwrap_or(0),
