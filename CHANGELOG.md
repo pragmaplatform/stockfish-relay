@@ -4,6 +4,13 @@ User-facing changes to Stockfish Relay, newest first. Historical entries are
 backfilled from Git history and grouped by package version in `Cargo.toml`;
 dates come from that history.
 
+## 0.3.4 - 2026-10-12
+
+### Changed
+
+- CI runs only on pushes, avoiding duplicate builds for branches with open
+  pull requests. Image publishing still runs on main-branch and version-tag pushes.
+
 ## 0.3.3 - 2026-10-12
 
 ### Changed
