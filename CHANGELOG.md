@@ -4,6 +4,17 @@ User-facing changes to Stockfish Relay, newest first. Historical entries are
 backfilled from Git history and grouped by package version in `Cargo.toml`;
 dates come from that history.
 
+## 0.3.4 - 2026-10-13
+
+### Changed
+
+- Assign jobs round-robin through shuffled worker slots, distributing turns in
+  proportion to worker capacity. Both claim endpoints use the same rotation,
+  skipping full, incompatible, or non-polling workers. Joining or departing
+  workers reshuffle the slots.
+- Skip incompatible queued jobs before searching the slot order and reuse engine
+  selections within each dispatch pass to keep mixed-engine backlogs responsive.
+
 ## 0.3.3 - 2026-10-12
 
 ### Changed

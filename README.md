@@ -164,6 +164,11 @@ On Render, add both variables to the master service's environment to enable it.
 ## Retries and scheduling
 
 Workers register their engine identity and capacity, then long-poll for jobs.
+The master shuffles one entry per worker slot when workers join or leave, then
+assigns jobs round-robin through that order. Workers with more slots receive
+proportionally more turns. Full workers, incompatible engines, and workers without
+a pending claim are skipped so they cannot block ready workers. Both claim and
+complete-and-claim follow the same rotation.
 Each assignment has a fresh attempt ID and a renewable lease. Heartbeats renew
 only assignments the worker actually acknowledges. A lost claim response therefore
 cannot strand a job indefinitely.
@@ -265,7 +270,7 @@ GitHub Actions publishes the `linux/amd64` image to
 `ghcr.io/pragmaplatform/stockfish-relay` after all CI checks pass:
 
 - Pushes to the default branch (`main`) publish the package version from
-  `Cargo.toml` (currently `0.3.3`), `latest`, and `sha-<full-commit-sha>`.
+  `Cargo.toml` (currently `0.3.4`), `latest`, and `sha-<full-commit-sha>`.
   The package-version tag updates on each successful main build until the version
   changes; use the commit tag or image digest to pin a specific build.
 - Version tag pushes such as `v1.2.3` publish `1.2.3`. Prerelease tags such as
