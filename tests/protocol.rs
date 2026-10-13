@@ -5,6 +5,30 @@ use stockfish_relay::{
     protocol::*,
 };
 
+#[test]
+fn legacy_worker_failures_remain_compatible_and_openapi_describes_errors() {
+    let outcome: Outcome = serde_json::from_value(serde_json::json!({
+        "status": "failed", "error": "old worker failed"
+    }))
+    .unwrap();
+    assert!(matches!(
+        outcome,
+        Outcome::Failed {
+            kind: stockfish_relay::error::FailureKind::EngineEvaluationFailed,
+            ..
+        }
+    ));
+    let schema = serde_json::to_value(http::openapi()).unwrap();
+    let responses = &schema["paths"]["/v1/evaluate"]["post"]["responses"];
+    assert!(responses.get("500").is_some());
+    assert!(responses.get("503").is_some());
+    assert!(responses.get("504").is_some());
+    assert!(responses.get("502").is_none());
+    let fields = &schema["components"]["schemas"]["ErrorBody"]["properties"];
+    assert!(fields.get("job_id").is_some());
+    assert!(fields.get("attempts").is_some());
+}
+
 fn config() -> stockfish_relay::config::MasterConfig {
     match Cli::parse_from([
         "stockfish-relay",

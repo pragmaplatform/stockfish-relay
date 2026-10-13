@@ -706,6 +706,7 @@ async fn a_silent_worker_is_replaced_over_http_and_its_late_result_is_rejected()
         .json(&Completion {
             assignment: abandoned.id,
             outcome: Outcome::Failed {
+                kind: Default::default(),
                 error: "late failure".into(),
             },
         })
@@ -1084,6 +1085,46 @@ done
     let mut engine = Stockfish::spawn(&config).await.unwrap();
     let request = EvaluateRequest::default().normalize(&master_config()).unwrap();
     let error = engine.evaluate(&request, 50).await.unwrap_err();
-    assert!(error.to_string().contains("timed out"));
+    assert!(matches!(error, Error::SearchTimeout));
     engine.terminate().await.unwrap();
+}
+
+#[tokio::test]
+async fn missing_exact_pv_returns_classified_failure_after_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bounded-score-only");
+    std::fs::write(
+        &path,
+        r#"#!/bin/sh
+while IFS= read -r line; do
+    case "$line" in
+        uci) printf '%s\n' 'id name Stockfish fixture' 'uciok' ;;
+        isready) printf '%s\n' 'readyok' ;;
+        go*) printf '%s\n' 'info depth 8 score cp 42 lowerbound nodes 100000 pv e2e4' 'bestmove e2e4' ;;
+    esac
+done
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let server = Server::start().await;
+    let (stop, task) = start_worker(&server, &path);
+    server.wait_workers(1).await;
+    let response = server
+        .client
+        .post(format!("{}v1/evaluate", server.origin))
+        .bearer_auth(API_KEY)
+        .json(&EvaluateRequest::default())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body: stockfish_relay::error::ErrorBody = response.json().await.unwrap();
+    assert_eq!(body.code, "incomplete_evaluation");
+    assert!(body.message.contains("exact principal variation"));
+    assert!(body.job_id.is_some());
+    assert_eq!(body.attempts, Some(master_config().max_attempts));
+    assert_eq!(server.status().await.failed, 1);
+    stop_worker(stop, task).await;
+    server.stop().await;
 }

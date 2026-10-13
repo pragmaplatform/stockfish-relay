@@ -6,6 +6,7 @@ use reqwest::{
 };
 use tokio::{sync::Mutex, task::JoinSet};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{config::WorkerConfig, engine::Stockfish, error::Error, protocol::*};
 
@@ -234,10 +235,15 @@ impl Session {
                     if engine.info != self.engine {
                         return Err(Error::Engine("Engine configuration changed since registration".into()));
                     }
-                    engine.evaluate(&assignment.request, assignment.search_timeout_ms).await
+                    engine.evaluate(&assignment.request, assignment.search_timeout_ms)
+                        .instrument(tracing::info_span!("evaluation",
+                            worker_id = %self.registration.worker_id,
+                            job_id = %assignment.id.job_id, attempt_id = %assignment.id.attempt_id,
+                            attempt = assignment.attempt, timeout_ms = assignment.search_timeout_ms))
+                        .await
                 }) => Some(match result {
                     Ok(result) => result,
-                    Err(_) => Err(Error::Engine("Search timed out".into())),
+                    Err(_) => Err(Error::SearchTimeout),
                 }),
             };
             if !matches!(searched, Some(Ok(_)))
@@ -252,8 +258,14 @@ impl Session {
             let outcome = match searched {
                 Ok(result) => Outcome::Succeeded { result },
                 Err(error) => {
-                    tracing::warn!(job_id = %assignment.id.job_id, attempt = assignment.attempt, %error, "Stockfish job failed");
+                    tracing::warn!(worker_id = %self.registration.worker_id,
+                        job_id = %assignment.id.job_id, attempt_id = %assignment.id.attempt_id,
+                        attempt = assignment.attempt, kind = ?error.failure_kind(), %error,
+                        engine = %self.engine.name, threads = self.engine.threads, hash_mb = self.engine.hash_mb,
+                        search = ?assignment.request.search, multipv = assignment.request.multipv,
+                        timeout_ms = assignment.search_timeout_ms, "Stockfish job failed");
                     Outcome::Failed {
+                        kind: error.failure_kind(),
                         error: error.to_string().chars().take(256).collect(),
                     }
                 }
