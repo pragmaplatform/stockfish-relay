@@ -1,6 +1,9 @@
 use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
+    collections::{HashMap, HashSet, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -34,6 +37,8 @@ struct State {
     interactive: VecDeque<Uuid>,
     batch: VecDeque<Uuid>,
     workers: HashMap<Uuid, Worker>,
+    slots: Vec<Uuid>,
+    next_slot: usize,
     interactive_streak: u8,
     completed: u64,
     retried: u64,
@@ -67,6 +72,21 @@ struct Worker {
     connected_at: Instant,
     seen: Instant,
     round_trips: RoundTrips,
+    waiting: Arc<AtomicUsize>,
+}
+
+// A dropped or timed-out long poll must stop participating in the rotation,
+// including when its future is cancelled before it can reacquire the state lock.
+struct WaitingClaim {
+    waiting: Arc<AtomicUsize>,
+    changed: Arc<Notify>,
+}
+
+impl Drop for WaitingClaim {
+    fn drop(&mut self) {
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        self.changed.notify_waiters();
+    }
 }
 
 pub async fn serve(listener: TcpListener, config: MasterConfig, shutdown: CancellationToken) -> Result<(), Error> {
@@ -195,8 +215,10 @@ impl Master {
                 connected_at,
                 seen: connected_at,
                 round_trips: RoundTrips::default(),
+                waiting: Arc::default(),
             },
         );
+        state.shuffle_slots();
         drop(state);
         self.changed.notify_waiters();
         Ok(WorkerSession {
@@ -210,6 +232,7 @@ impl Master {
 
     pub async fn claim(&self, worker_id: Uuid) -> Result<Option<Assignment>, ApiError> {
         let until = Instant::now() + Duration::from_millis(self.config.long_poll_ms);
+        let mut waiting = None;
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -229,25 +252,52 @@ impl Master {
                         "All worker slots are assigned",
                     ));
                 }
-                let interactive = state
-                    .interactive
+                if waiting.is_none() {
+                    worker.waiting.fetch_add(1, Ordering::Relaxed);
+                    waiting = Some(WaitingClaim {
+                        waiting: Arc::clone(&worker.waiting),
+                        changed: Arc::clone(&self.changed),
+                    });
+                }
+                let available: HashSet<_> = state
+                    .workers
                     .iter()
-                    .position(|id| state.jobs.get(id).is_some_and(|job| compatible(&job.request, worker)));
-                let batch = state
-                    .batch
-                    .iter()
-                    .position(|id| state.jobs.get(id).is_some_and(|job| compatible(&job.request, worker)));
-                let selected =
-                    if let Some(index) = interactive.filter(|_| state.interactive_streak < 8 || batch.is_none()) {
-                        state.interactive_streak = state.interactive_streak.saturating_add(1);
-                        state.interactive.remove(index)
-                    } else if let Some(index) = batch {
-                        state.interactive_streak = 0;
-                        state.batch.remove(index)
-                    } else {
-                        None
-                    };
-                if let Some(job_id) = selected {
+                    .filter(|(id, worker)| {
+                        worker.waiting.load(Ordering::Relaxed) > 0
+                            && state.running(**id) < usize::from(worker.registration.capacity)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                // Reuse engine selections across both queues for this locked pass.
+                // The next wakeup must reconsider availability and the slot cursor.
+                let mut preferred_slots = HashMap::new();
+                let mut queued_for_worker = |queue: &VecDeque<Uuid>| {
+                    queue.iter().enumerate().find_map(|(index, id)| {
+                        let job = state.jobs.get(id)?;
+                        if !compatible(&job.request, worker) {
+                            return None;
+                        }
+                        let slot = (*preferred_slots
+                            .entry(job.request.engine.as_deref())
+                            .or_insert_with(|| state.slot_for(&job.request, &available)))?;
+                        (state.slots[slot] == worker_id).then_some((index, slot))
+                    })
+                };
+                let interactive = queued_for_worker(&state.interactive);
+                let batch = queued_for_worker(&state.batch);
+                let selected = if let Some((index, slot)) =
+                    interactive.filter(|_| state.interactive_streak < 8 || batch.is_none())
+                {
+                    state.interactive_streak = state.interactive_streak.saturating_add(1);
+                    state.interactive.remove(index).map(|id| (id, slot))
+                } else if let Some((index, slot)) = batch {
+                    state.interactive_streak = 0;
+                    state.batch.remove(index).map(|id| (id, slot))
+                } else {
+                    None
+                };
+                if let Some((job_id, slot)) = selected {
+                    state.next_slot = (slot + 1) % state.slots.len();
                     let job = state.jobs.get_mut(&job_id).ok_or_else(ApiError::stale)?;
                     let now = Instant::now();
                     job.queue_wait += now.duration_since(job.queued_at);
@@ -375,6 +425,7 @@ impl Master {
         if state.workers.remove(&worker_id).is_none() {
             return Err(ApiError::unknown_worker());
         }
+        state.shuffle_slots();
         let jobs: Vec<_> = state
             .jobs
             .iter()
@@ -434,6 +485,8 @@ impl Master {
                 .send(Err(ApiError::unavailable("Master is shutting down; retry the request")));
         }
         state.workers.clear();
+        state.slots.clear();
+        state.next_slot = 0;
         state.interactive.clear();
         state.batch.clear();
         drop(state);
@@ -442,6 +495,26 @@ impl Master {
 }
 
 impl State {
+    fn shuffle_slots(&mut self) {
+        // One turn per advertised slot makes the rotation capacity-weighted.
+        self.slots = self
+            .workers
+            .iter()
+            .flat_map(|(id, worker)| std::iter::repeat_n(*id, usize::from(worker.registration.capacity)))
+            .collect();
+        fastrand::shuffle(&mut self.slots);
+        self.next_slot = 0;
+    }
+
+    fn slot_for(&self, request: &EvaluateRequest, available: &HashSet<Uuid>) -> Option<usize> {
+        (self.next_slot..self.slots.len())
+            .chain(0..self.next_slot)
+            .find(|&slot| {
+                let id = self.slots[slot];
+                available.contains(&id) && self.workers.get(&id).is_some_and(|worker| compatible(request, worker))
+            })
+    }
+
     fn enqueue(&mut self, id: Uuid, priority: Priority) {
         match priority {
             Priority::Interactive => self.interactive.push_back(id),
@@ -469,8 +542,12 @@ impl State {
                 let _ = job.reply.send(Err(request_timeout()));
             }
         }
+        let worker_count = self.workers.len();
         self.workers
             .retain(|_, worker| worker.seen + Duration::from_millis(config.lease_ms) > now);
+        if self.workers.len() != worker_count {
+            self.shuffle_slots();
+        }
         let abandoned: Vec<_> = self
             .jobs
             .iter()

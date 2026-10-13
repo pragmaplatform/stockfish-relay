@@ -1,8 +1,9 @@
-use std::time::Duration;
+use std::{future::Future, pin::Pin, task::Poll, time::Duration};
 
 use axum::http::StatusCode;
 use stockfish_relay::{config::MasterConfig, master::Master, protocol::*};
 use tokio::task::JoinHandle;
+use uuid::Uuid;
 
 fn config() -> MasterConfig {
     MasterConfig {
@@ -72,6 +73,238 @@ fn assert_timing(metric: &Option<TimingMetric>, expected: f64) {
     let metric = metric.as_ref().unwrap();
     assert!((metric.average_ms - expected).abs() < 1e-9);
     assert!((metric.p95_ms - expected).abs() < 1e-9);
+}
+
+async fn assert_pending<T>(mut future: Pin<&mut impl Future<Output = T>>) {
+    std::future::poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+}
+
+async fn rotation(master: &Master, workers: &[Uuid], turns: usize) -> Vec<Uuid> {
+    let mut order = Vec::new();
+    for _ in 0..turns {
+        let mut claims: Vec<_> = workers.iter().map(|&id| Box::pin(master.claim(id))).collect();
+        for claim in &mut claims {
+            assert_pending(claim.as_mut()).await;
+        }
+        // Poll in a fixed order, making the first worker win every request if
+        // dispatch ever regresses to first-claim-wins scheduling.
+        let response = submit(master, EvaluateRequest::default()).await;
+        let (id, assignment) = std::future::poll_fn(|cx| {
+            for (&id, claim) in workers.iter().zip(&mut claims) {
+                if let Poll::Ready(result) = claim.as_mut().poll(cx) {
+                    return Poll::Ready((id, result.unwrap().unwrap()));
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+        drop(claims);
+        master.complete(id, success(&assignment)).await.unwrap();
+        response.await.unwrap().unwrap();
+        order.push(id);
+    }
+    order
+}
+
+#[tokio::test(start_paused = true)]
+async fn shuffled_slots_repeat_a_capacity_weighted_rotation_and_include_membership_changes() {
+    let master = Master::new(config()).unwrap();
+    let mut workers = Vec::new();
+    for capacity in [1, 2, 3] {
+        let registration = RegisterWorker { capacity, ..worker() };
+        workers.push(master.register(registration, None).await.unwrap().worker_id);
+    }
+    let order = rotation(&master, &workers, 18).await;
+    for (index, id) in workers.iter().enumerate() {
+        assert_eq!(order[..6].iter().filter(|owner| *owner == id).count(), index + 1);
+    }
+    assert_eq!(order[..6], order[6..12]);
+    assert_eq!(order[..6], order[12..]);
+
+    master.unregister(workers.remove(1)).await.unwrap();
+    workers.push(master.register(worker(), None).await.unwrap().worker_id);
+    let order = rotation(&master, &workers, 10).await;
+    for (&id, capacity) in workers.iter().zip([1, 3, 1]) {
+        assert_eq!(order[..5].iter().filter(|owner| **owner == id).count(), capacity);
+    }
+    assert_eq!(order[..5], order[5..]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn complete_and_claim_cannot_steal_the_next_workers_turn() {
+    let master = Master::new(config()).unwrap();
+    let first = master.register(worker(), None).await.unwrap().worker_id;
+    let second = master.register(worker(), None).await.unwrap().worker_id;
+    let response = submit(&master, EvaluateRequest::default()).await;
+    let assignment = master.claim(first).await.unwrap().unwrap();
+    let mut second_claim = Box::pin(master.claim(second));
+    assert_pending(second_claim.as_mut()).await;
+
+    // Queue the next job without letting the second worker run yet. The first
+    // worker completes and tries to reclaim before the second worker wakes.
+    let mut next_response = Box::pin(master.evaluate(EvaluateRequest::default()));
+    assert_pending(next_response.as_mut()).await;
+    let mut first_claim = Box::pin(master.complete_and_claim(first, success(&assignment)));
+    assert_pending(first_claim.as_mut()).await;
+    response.await.unwrap().unwrap();
+    let next_assignment = second_claim.await.unwrap().unwrap();
+    master.complete(second, success(&next_assignment)).await.unwrap();
+    next_response.await.unwrap();
+
+    let third_response = submit(&master, EvaluateRequest::default()).await;
+    let third_assignment = first_claim.await.unwrap().unwrap();
+    master.complete(first, success(&third_assignment)).await.unwrap();
+    third_response.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_and_timed_out_claims_do_not_block_the_rotation() {
+    for cancel in [true, false] {
+        let master = Master::new(config()).unwrap();
+        let first = master.register(worker(), None).await.unwrap().worker_id;
+        let second = master.register(worker(), None).await.unwrap().worker_id;
+        let response = submit(&master, EvaluateRequest::default()).await;
+        let assignment = master.claim(first).await.unwrap().unwrap();
+        master.complete(first, success(&assignment)).await.unwrap();
+        response.await.unwrap().unwrap();
+
+        // The second worker owns the next turn, but its poll disappears while
+        // the worker itself remains registered and has spare capacity.
+        let mut second_claim = Box::pin(master.claim(second));
+        assert_pending(second_claim.as_mut()).await;
+        if cancel {
+            drop(second_claim);
+        } else {
+            assert!(second_claim.await.unwrap().is_none());
+        }
+        let response = submit(&master, EvaluateRequest::default()).await;
+        let assignment = master.claim(first).await.unwrap().unwrap();
+        master.complete(first, success(&assignment)).await.unwrap();
+        response.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn rotation_skips_full_workers_and_waiting_incompatible_engines() {
+    let master = Master::new(config()).unwrap();
+    let full = master.register(worker(), None).await.unwrap().worker_id;
+    let ready = master.register(worker(), None).await.unwrap().worker_id;
+    let mut registration = worker();
+    registration.engine.name = "Another engine".into();
+    let incompatible = master.register(registration, None).await.unwrap().worker_id;
+    let mut extra_claim = Box::pin(master.claim(full));
+    assert_pending(extra_claim.as_mut()).await;
+    let response = submit(&master, EvaluateRequest::default()).await;
+    let assignment = master.claim(full).await.unwrap().unwrap();
+    let mut incompatible_claim = Box::pin(master.claim(incompatible));
+    assert_pending(incompatible_claim.as_mut()).await;
+
+    // The full worker still has an outstanding poll, but cannot take another
+    // assignment. The other polling engine cannot run the requested job.
+    let next_response = submit(
+        &master,
+        EvaluateRequest {
+            engine: Some(worker().engine.name),
+            ..Default::default()
+        },
+    )
+    .await;
+    let next_assignment = master.claim(ready).await.unwrap().unwrap();
+    assert_eq!(master.status().await.running, 2);
+    assert_eq!(extra_claim.await.unwrap_err().body.code, "worker_full");
+    master.complete(full, success(&assignment)).await.unwrap();
+    master.complete(ready, success(&next_assignment)).await.unwrap();
+    response.await.unwrap().unwrap();
+    next_response.await.unwrap().unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn mixed_engine_backlogs_preserve_priority_and_refresh_the_rotation() {
+    let master = Master::new(MasterConfig {
+        queue_capacity: 128,
+        ..config()
+    })
+    .unwrap();
+    let first = master.register(worker(), None).await.unwrap().worker_id;
+    let second = master.register(worker(), None).await.unwrap().worker_id;
+    let mut other = worker();
+    other.capacity = 256;
+    other.engine.name = "Another engine".into();
+    master.register(other, None).await.unwrap();
+
+    let response = submit(&master, EvaluateRequest::default()).await;
+    let assignment = master.claim(first).await.unwrap().unwrap();
+    master.complete(first, success(&assignment)).await.unwrap();
+    response.await.unwrap().unwrap();
+
+    let mut first_claim = Box::pin(master.claim(first));
+    let mut second_claim = Box::pin(master.claim(second));
+    assert_pending(first_claim.as_mut()).await;
+    assert_pending(second_claim.as_mut()).await;
+    let mut backlog = Vec::new();
+    for _ in 0..64 {
+        backlog.push(
+            submit(
+                &master,
+                EvaluateRequest {
+                    engine: Some("Another engine".into()),
+                    priority: Priority::Interactive,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    let batch = submit(
+        &master,
+        EvaluateRequest {
+            engine: Some(worker().engine.name),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut interactive = Vec::new();
+    for engine in [Some(worker().engine.name), None] {
+        interactive.push(
+            submit(
+                &master,
+                EvaluateRequest {
+                    engine,
+                    priority: Priority::Interactive,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+
+    // Named and unrestricted jobs share the queues, but rotation decisions must
+    // be refreshed after an assignment rather than reusing the previous owner.
+    assert_pending(first_claim.as_mut()).await;
+    let assignment = second_claim.await.unwrap().unwrap();
+    assert_eq!(assignment.request.priority, Priority::Interactive);
+    assert_eq!(assignment.request.engine, Some(worker().engine.name));
+    master.complete(second, success(&assignment)).await.unwrap();
+    let assignment = first_claim.await.unwrap().unwrap();
+    assert_eq!(assignment.request.priority, Priority::Interactive);
+    assert_eq!(assignment.request.engine, None);
+    master.complete(first, success(&assignment)).await.unwrap();
+    let assignment = master.claim(first).await.unwrap().unwrap();
+    assert_eq!(assignment.request.priority, Priority::Batch);
+    master.complete(first, success(&assignment)).await.unwrap();
+    batch.await.unwrap().unwrap();
+    for response in interactive {
+        response.await.unwrap().unwrap();
+    }
+    assert_eq!(master.status().await.queued_interactive, 64);
+    for response in backlog {
+        response.abort();
+        let _ = response.await;
+    }
 }
 
 #[tokio::test(start_paused = true)]
