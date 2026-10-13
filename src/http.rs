@@ -101,7 +101,7 @@ async fn ready(State(master): State<Master>) -> StatusCode {
         (status = 400, body = ErrorBody),
         (status = 401, body = ErrorBody),
         (status = 429, body = ErrorBody),
-        (status = 502, body = ErrorBody),
+        (status = 500, body = ErrorBody),
         (status = 503, body = ErrorBody),
         (status = 504, body = ErrorBody)
     )

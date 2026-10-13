@@ -4,6 +4,16 @@ User-facing changes to Stockfish Relay, newest first. Historical entries are
 backfilled from Git history and grouped by package version in `Cargo.toml`;
 dates come from that history.
 
+## 0.3.5 - 2026-10-13
+
+### Changed
+
+- Classify exhausted evaluations as engine failures (500), lost workers (503), or
+  search timeouts (504), with job IDs and attempt counts in error responses.
+  Older worker failure reports remain supported as generic engine failures.
+- Correlate master and worker failure logs with assignment IDs and search settings;
+  log recovered evaluations and bounded UCI diagnostics for missing exact scores.
+
 ## 0.3.4 - 2026-10-13
 
 ### Changed

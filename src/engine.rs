@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, process::Stdio, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    process::Stdio,
+    time::Duration,
+};
 
 use cozy_chess::{GameStatus, util};
 use tokio::{
@@ -83,7 +87,7 @@ impl Stockfish {
     pub async fn evaluate(&mut self, request: &EvaluateRequest, timeout_ms: u64) -> Result<Evaluation, Error> {
         match timeout(Duration::from_millis(timeout_ms), self.search(request)).await {
             Ok(result) => result,
-            Err(_) => Err(Error::Engine("Search timed out".into())),
+            Err(_) => Err(Error::SearchTimeout),
         }
     }
 
@@ -165,8 +169,10 @@ impl Stockfish {
         };
         self.command(&format!("go {limit}{restriction}")).await?;
         let mut snapshots = MultiPvSnapshots::default();
+        let mut transcript = UciTranscript::default();
         let best = loop {
             let line = self.line().await?;
+            transcript.record(&line);
             if let Some(rest) = line.strip_prefix("bestmove ") {
                 let mv = rest
                     .split_whitespace()
@@ -177,9 +183,14 @@ impl Stockfish {
             }
             snapshots.record(&line, expected);
         };
-        let mut variations = snapshots
-            .matching(&best)
-            .ok_or_else(|| Error::Engine("No completed exact principal variation".into()))?;
+        let Some(mut variations) = snapshots.matching(&best) else {
+            tracing::warn!(engine = %self.info.name, threads = self.info.threads, hash_mb = self.info.hash_mb,
+                ?search, multipv = request.multipv, search_moves = ?request.search_moves,
+                fen = ?request.fen, moves = ?request.moves, best_move = %best,
+                elapsed_ms = started.elapsed().as_millis(),
+                uci_tail = ?transcript.lines, "Stockfish returned no matching exact evaluation");
+            return Err(Error::IncompleteEvaluation);
+        };
         for variation in &mut variations {
             let mut continuation = board.clone();
             for uci in &mut variation.pv {
@@ -219,6 +230,21 @@ impl Stockfish {
             .next_line()
             .await?
             .ok_or_else(|| Error::Engine("Process exited before completing the search".into()))
+    }
+}
+
+/// Retain bounded diagnostic output without logging successful searches.
+#[derive(Default)]
+struct UciTranscript {
+    lines: VecDeque<String>,
+}
+
+impl UciTranscript {
+    fn record(&mut self, line: &str) {
+        if self.lines.len() == 16 {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line.chars().take(512).collect());
     }
 }
 
@@ -303,6 +329,18 @@ fn parse_info(line: &str) -> Option<Variation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_transcript_keeps_only_a_bounded_tail() {
+        let mut transcript = UciTranscript::default();
+        for _ in 0..20 {
+            transcript.record(&"é".repeat(1000));
+        }
+        transcript.record("bestmove e2e4");
+        assert_eq!(transcript.lines.len(), 16);
+        assert_eq!(transcript.lines.front().unwrap().chars().count(), 512);
+        assert_eq!(transcript.lines.back().unwrap(), "bestmove e2e4");
+    }
 
     #[test]
     fn bounds_and_incomplete_info_are_not_exact_evaluations() {

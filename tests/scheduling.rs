@@ -336,6 +336,7 @@ async fn job_timings_measure_queue_execution_overhead_and_retries_without_counti
             Completion {
                 assignment: failed.id,
                 outcome: Outcome::Failed {
+                    kind: Default::default(),
                     error: "engine exited".into(),
                 },
             },
@@ -522,6 +523,7 @@ async fn worker_errors_retry_immediately_and_duplicate_completions_cannot_finish
             Completion {
                 assignment: first.id,
                 outcome: Outcome::Failed {
+                    kind: Default::default(),
                     error: "engine process exited".into(),
                 },
             },
@@ -601,33 +603,74 @@ async fn only_acknowledged_assignments_are_renewed_by_heartbeats() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn repeated_worker_failure_is_bounded_by_the_attempt_limit() {
+async fn repeated_worker_failure_is_bounded_and_preserves_classification() {
+    use stockfish_relay::error::FailureKind;
+    for (kind, status, code) in [
+        (
+            FailureKind::EngineEvaluationFailed,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "engine_evaluation_failed",
+        ),
+        (
+            FailureKind::IncompleteEvaluation,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "incomplete_evaluation",
+        ),
+        (
+            FailureKind::SearchTimeout,
+            StatusCode::GATEWAY_TIMEOUT,
+            "search_timeout",
+        ),
+    ] {
+        let mut config = config();
+        config.max_attempts = 2;
+        let master = Master::new(config).unwrap();
+        let worker = master.register(worker(), None).await.unwrap();
+        let response = submit(&master, EvaluateRequest::default()).await;
+        let mut job_id = None;
+        for _ in 0..2 {
+            let job = master.claim(worker.worker_id).await.unwrap().unwrap();
+            job_id = Some(job.id.job_id);
+            master
+                .complete(
+                    worker.worker_id,
+                    Completion {
+                        assignment: job.id,
+                        outcome: Outcome::Failed {
+                            kind,
+                            error: "engine failed".into(),
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let error = response.await.unwrap().unwrap_err();
+        assert_eq!(error.status, status);
+        assert_eq!(error.body.code, code);
+        assert_eq!(error.body.job_id, job_id);
+        assert_eq!(error.body.attempts, Some(2));
+        let status = master.status().await;
+        assert_eq!(status.failed, 1);
+        assert_eq!(status.retried, 1);
+        assert_eq!(status.running + status.queued_batch, 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn exhausted_worker_departure_returns_unavailable_with_job_context() {
     let mut config = config();
-    config.max_attempts = 2;
+    config.max_attempts = 1;
     let master = Master::new(config).unwrap();
     let worker = master.register(worker(), None).await.unwrap();
     let response = submit(&master, EvaluateRequest::default()).await;
-    for _ in 0..2 {
-        let job = master.claim(worker.worker_id).await.unwrap().unwrap();
-        master
-            .complete(
-                worker.worker_id,
-                Completion {
-                    assignment: job.id,
-                    outcome: Outcome::Failed {
-                        error: "engine failed".into(),
-                    },
-                },
-            )
-            .await
-            .unwrap();
-    }
+    let job = master.claim(worker.worker_id).await.unwrap().unwrap();
+    master.unregister(worker.worker_id).await.unwrap();
     let error = response.await.unwrap().unwrap_err();
-    assert_eq!(error.status, StatusCode::BAD_GATEWAY);
-    assert_eq!(error.body.code, "attempts_exhausted");
-    let status = master.status().await;
-    assert_eq!(status.failed, 1);
-    assert_eq!(status.running + status.queued_batch, 0);
+    assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error.body.code, "worker_unavailable");
+    assert_eq!(error.body.job_id, Some(job.id.job_id));
+    assert_eq!(error.body.attempts, Some(1));
 }
 
 #[tokio::test(start_paused = true)]

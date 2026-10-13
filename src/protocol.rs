@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{config::MasterConfig, error::ApiError};
+use crate::{
+    config::MasterConfig,
+    error::{ApiError, FailureKind},
+};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
@@ -150,8 +153,14 @@ pub struct HeartbeatResponse {
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Outcome {
-    Succeeded { result: Evaluation },
-    Failed { error: String },
+    Succeeded {
+        result: Evaluation,
+    },
+    Failed {
+        error: String,
+        #[serde(default)]
+        kind: FailureKind,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]

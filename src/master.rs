@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::{
     config::MasterConfig,
-    error::{ApiError, Error},
+    error::{ApiError, Error, FailureKind},
     protocol::*,
     timings::{RoundTrips, Sample, Timings},
 };
@@ -166,18 +166,26 @@ impl Master {
             );
         }
         self.changed.notify_waiters();
-        let result = match tokio::time::timeout_at(deadline, receiver).await {
+        let mut result = match tokio::time::timeout_at(deadline, receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ApiError::unavailable("Master stopped")),
             Err(_) => Err(request_timeout()),
         };
         let mut state = self.state.lock().await;
-        if state.jobs.remove(&job_id).is_some() {
+        if let Some(job) = state.jobs.remove(&job_id) {
             state.failed += 1;
+            if let Err(error) = &mut result {
+                error.body.job_id = Some(job_id);
+                error.body.attempts = Some(job.attempts);
+            }
         }
         state.prune_queues();
         drop(state);
         self.changed.notify_waiters();
+        if let Err(error) = &result {
+            tracing::warn!(%job_id, attempts = ?error.body.attempts, status = %error.status,
+                code = %error.body.code, message = %error.body.message, "Evaluation request failed");
+        }
         result
     }
 
@@ -393,17 +401,22 @@ impl Master {
                 let job = state.jobs.remove(&id).ok_or_else(ApiError::stale)?;
                 state.timings.record(sample);
                 state.completed += 1;
+                if job.attempts > 1 {
+                    tracing::info!(job_id = %id, %worker_id, attempts = job.attempts,
+                        elapsed_ms = now.duration_since(job.accepted_at).as_millis(),
+                        "Evaluation recovered after retry");
+                }
                 let _ = job.reply.send(Ok(EvaluateResponse {
                     job_id: id,
                     attempts: job.attempts,
                     result,
                 }));
             }
-            Outcome::Failed { error } => {
+            Outcome::Failed { error, kind } => {
                 if error.len() > 1024 {
                     return Err(ApiError::invalid("Worker error is too long"));
                 }
-                state.retry(completion.assignment.job_id, &self.config, &error);
+                state.retry(completion.assignment.job_id, &self.config, kind, &error);
             }
         }
         drop(state);
@@ -437,7 +450,7 @@ impl Master {
             })
             .collect();
         for id in jobs {
-            state.retry(id, &self.config, "Worker disconnected");
+            state.retry(id, &self.config, FailureKind::WorkerUnavailable, "Worker disconnected");
         }
         drop(state);
         self.changed.notify_waiters();
@@ -539,7 +552,7 @@ impl State {
         for id in expired {
             if let Some(job) = self.jobs.remove(&id) {
                 self.failed += 1;
-                let _ = job.reply.send(Err(request_timeout()));
+                let _ = job.reply.send(Err(request_timeout().with_job(id, job.attempts)));
             }
         }
         let worker_count = self.workers.len();
@@ -557,32 +570,41 @@ impl State {
                     .filter(|lease| {
                         lease.expires <= now || lease.deadline <= now || !self.workers.contains_key(&lease.worker_id)
                     })
-                    .map(|_| *id)
+                    .map(|lease| {
+                        (
+                            *id,
+                            if lease.deadline <= now {
+                                FailureKind::SearchTimeout
+                            } else {
+                                FailureKind::WorkerUnavailable
+                            },
+                        )
+                    })
             })
             .collect();
-        for id in abandoned {
-            self.retry(id, config, "Worker assignment expired");
+        for (id, kind) in abandoned {
+            self.retry(id, config, kind, "Worker assignment expired");
         }
         self.prune_queues();
     }
 
-    fn retry(&mut self, id: Uuid, config: &MasterConfig, reason: &str) {
+    fn retry(&mut self, id: Uuid, config: &MasterConfig, kind: FailureKind, reason: &str) {
         let Some(job) = self.jobs.get_mut(&id) else { return };
-        if job.attempts >= config.max_attempts {
+        let exhausted = job.attempts >= config.max_attempts;
+        tracing::warn!(job_id = %id, worker_id = ?job.lease.as_ref().map(|lease| lease.worker_id),
+            attempt_id = ?job.lease.as_ref().map(|lease| lease.id.attempt_id),
+            attempts = job.attempts, max_attempts = config.max_attempts, exhausted, ?kind, %reason,
+            search = ?job.request.search, multipv = job.request.multipv, priority = ?job.request.priority,
+            elapsed_ms = job.accepted_at.elapsed().as_millis(), "Evaluation attempt failed");
+        if exhausted {
             if let Some(job) = self.jobs.remove(&id) {
                 self.failed += 1;
-                tracing::warn!(job_id = %id, attempts = job.attempts, %reason, "Evaluation exhausted retries");
-                let _ = job.reply.send(Err(ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "attempts_exhausted",
-                    "Stockfish work failed after the configured attempt limit",
-                )));
+                let _ = job.reply.send(Err(kind.api_error().with_job(id, job.attempts)));
             }
         } else {
             job.lease = None;
             job.queued_at = Instant::now();
             let priority = job.request.priority;
-            tracing::warn!(job_id = %id, attempts = job.attempts, %reason, "Requeuing evaluation");
             self.retried += 1;
             self.enqueue(id, priority);
         }

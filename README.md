@@ -181,8 +181,23 @@ cannot strand a job indefinitely.
   cannot overwrite the current attempt's result.
 - Retries allow at-least-once execution: after a network partition, an old search
   can briefly overlap its replacement. Only the current assignment is accepted.
-- The default limit is three total attempts, returning `502` after exhaustion.
-  A 120-second overall deadline includes queuing and retries, returning `504`.
+- The default limit is three total attempts. Exhaustion returns `500` for engine
+  failures (`engine_evaluation_failed` or `incomplete_evaluation`), `503` for lost
+  workers (`worker_unavailable`), or `504` for search timeouts (`search_timeout`).
+  The final attempt determines the classification. Exhausted responses include
+  `code`, `message`, `job_id`, and `attempts`; failures before admission have no job context.
+  A 120-second overall deadline includes queuing and retries, returning `504`
+  (`request_timeout`).
+- Worker failure reports carry a typed `kind`. Older workers remain compatible;
+  reports without `kind` are classified as `engine_evaluation_failed`. Upgrade
+  workers as well as the master for precise classification and engine diagnostics.
+- Master failure logs include job/attempt/worker IDs, classification, reason,
+  search settings, elapsed time, and whether retries were exhausted. Recovery logs
+  identify evaluations that succeeded after retrying. Worker failures include
+  engine identity, threads, hash memory, and search timeout. Missing exact
+  evaluations additionally log the starting FEN, move history, best move, and
+  the last 16 UCI output lines (at most 512 characters per line), correlated with
+  the assignment IDs. Successful searches do not log UCI transcripts.
 - New requests receive `503` when no matching worker is connected and `429` when
   capacity is full. Existing requests can wait for workers to reconnect until
   their deadline. A master restart loses pending jobs; callers must retry.
@@ -270,7 +285,7 @@ GitHub Actions publishes the `linux/amd64` image to
 `ghcr.io/pragmaplatform/stockfish-relay` after all CI checks pass:
 
 - Pushes to the default branch (`main`) publish the package version from
-  `Cargo.toml` (currently `0.3.4`), `latest`, and `sha-<full-commit-sha>`.
+  `Cargo.toml` (currently `0.3.5`), `latest`, and `sha-<full-commit-sha>`.
   The package-version tag updates on each successful main build until the version
   changes; use the commit tag or image digest to pin a specific build.
 - Version tag pushes such as `v1.2.3` publish `1.2.3`. Prerelease tags such as
