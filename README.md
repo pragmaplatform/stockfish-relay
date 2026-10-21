@@ -13,7 +13,13 @@ See the [changelog](CHANGELOG.md) for changes by version.
 
 ## Quick start
 
-Build and install the binary from the repository root:
+Install the published binary from crates.io:
+
+```bash
+cargo install stockfish-relay --locked
+```
+
+Or build and install it from the repository root:
 
 ```bash
 cargo install --path . --locked
@@ -24,9 +30,9 @@ without installing, use `cargo build --release --locked`. Both machines run the
 same binary. Only workers need a separately installed Stockfish executable;
 Stockfish 19 is tested. Set an absolute path with `STOCKFISH_PATH`.
 
-Copy `.env.example` to `.env`, replace both keys with separately generated values
-(`openssl rand -hex 32`), and adjust the engine path. For a local smoke test, load
-that environment in each of two terminals:
+For a local smoke test from the repository, copy `.env.example` to `.env`, replace
+both keys with separately generated values (`openssl rand -hex 32`), and adjust
+the engine path. Load that environment in each of two terminals:
 
 ```bash
 set -a

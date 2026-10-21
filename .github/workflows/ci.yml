@@ -8,7 +8,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,6 +48,55 @@ jobs:
         env:
           STOCKFISH_RELAY_TEST_ENGINE: /usr/games/stockfish
         run: cargo test --locked --test end_to_end real_stockfish_roundtrip -- --ignored
+
+      - name: Verify Cargo package
+        run: cargo package --locked
+
+  publish-crate:
+    name: Publish crate to crates.io
+    needs: check
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'pragmaplatform/stockfish-relay' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
+        with:
+          toolchain: 1.98.1
+
+      - name: Check whether the crate version is published
+        id: version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+          status=$(curl --silent --show-error --retry 3 --max-time 30 \
+            --user-agent 'stockfish-relay-ci (https://github.com/pragmaplatform/stockfish-relay)' \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/stockfish-relay/$version")
+          case "$status" in
+            200)
+              echo "stockfish-relay $version is already published; skipping."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Failed to check crates.io for stockfish-relay $version (HTTP $status)."
+              exit 1
+              ;;
+          esac
+
+      - name: Publish crate
+        if: steps.version.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked --registry crates-io
 
   publish:
     name: Publish container to GHCR
