@@ -22,6 +22,7 @@ struct Session {
 
 pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> Result<(), Error> {
     config.validate()?;
+    let started = tokio::time::Instant::now();
     tracing::info!(version = env!("CARGO_PKG_VERSION"), name = %config.name, "Stockfish Relay worker starting");
     let mut headers = HeaderMap::new();
     let mut authorization = HeaderValue::from_str(&format!("Bearer {}", config.worker_key))
@@ -63,10 +64,14 @@ pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> Result<()
             _ = shutdown.cancelled() => return Ok(()),
             result = register(&client, &config, &request) => result,
         };
+        let worker_id = registration.as_ref().ok().map(|registration| registration.worker_id);
+        let session_started = tokio::time::Instant::now();
         let result = match registration {
             Ok(registration) => {
                 backoff_ms = 1000;
-                tracing::info!(worker_id = %registration.worker_id, capacity = config.concurrency, engine = %engine.name, "Connected to master");
+                tracing::info!(worker_id = %registration.worker_id, capacity = config.concurrency, engine = %engine.name,
+                    heartbeat_ms = registration.heartbeat_ms, lease_ms = registration.lease_ms,
+                    long_poll_ms = registration.long_poll_ms, "Connected to master");
                 let session = Session {
                     client: client.clone(),
                     config: Arc::clone(&config),
@@ -79,17 +84,29 @@ pub async fn run(config: WorkerConfig, shutdown: CancellationToken) -> Result<()
             }
             Err(error) => Err(error),
         };
+        let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]);
+        let retry_delay_ms = backoff_ms + jitter;
         if let Err(error) = result {
             if matches!(&error, Error::Http(error) if error.status().is_some_and(|status| matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN | StatusCode::BAD_REQUEST)))
             {
                 return Err(error);
             }
-            tracing::warn!(%error, "Worker disconnected; reconnecting");
+            let http_error = match &error {
+                Error::Http(error) => Some(error),
+                _ => None,
+            };
+            tracing::warn!(%error, error_details = ?error,
+                worker_id = worker_id.as_ref().map(tracing::field::display),
+                process_uptime_seconds = started.elapsed().as_secs(),
+                session_duration_seconds = worker_id.map(|_| session_started.elapsed().as_secs()),
+                is_timeout = http_error.map(reqwest::Error::is_timeout),
+                is_connect = http_error.map(reqwest::Error::is_connect),
+                http_status = http_error.and_then(reqwest::Error::status).map(|status| status.as_u16()),
+                retry_delay_ms, "Worker disconnected; reconnecting");
         }
-        let jitter = u64::from(uuid::Uuid::new_v4().as_bytes()[0]);
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
-            _ = tokio::time::sleep(Duration::from_millis(backoff_ms + jitter)) => {},
+            _ = tokio::time::sleep(Duration::from_millis(retry_delay_ms)) => {},
         }
         backoff_ms = (backoff_ms * 2).min(30_000);
     }

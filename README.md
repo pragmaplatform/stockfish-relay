@@ -198,6 +198,10 @@ cannot strand a job indefinitely.
   evaluations additionally log the starting FEN, move history, best move, and
   the last 16 UCI output lines (at most 512 characters per line), correlated with
   the assignment IDs. Successful searches do not log UCI transcripts.
+- Worker reconnect warnings include the nested error details, timeout and
+  connection-error flags, HTTP status when available, worker ID, process uptime,
+  session duration, and retry delay. Connection logs include the negotiated
+  heartbeat, lease, and long-poll intervals to help diagnose timing failures.
 - New requests receive `503` when no matching worker is connected and `429` when
   capacity is full. Existing requests can wait for workers to reconnect until
   their deadline. A master restart loses pending jobs; callers must retry.
@@ -285,7 +289,7 @@ GitHub Actions publishes the `linux/amd64` image to
 `ghcr.io/pragmaplatform/stockfish-relay` after all CI checks pass:
 
 - Pushes to the default branch (`main`) publish the package version from
-  `Cargo.toml` (currently `0.3.5`), `latest`, and `sha-<full-commit-sha>`.
+  `Cargo.toml` (currently `0.3.6`), `latest`, and `sha-<full-commit-sha>`.
   The package-version tag updates on each successful main build until the version
   changes; use the commit tag or image digest to pin a specific build.
 - Version tag pushes such as `v1.2.3` publish `1.2.3`. Prerelease tags such as
