@@ -66,41 +66,31 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Check whether the crate version is published
-        id: version
-        run: |
-          python3 - <<'PY'
-          import os
-          import tomllib
-          import urllib.error
-          import urllib.request
-
-          with open("Cargo.toml", "rb") as manifest:
-              package = tomllib.load(manifest)["package"]
-          name, version = package["name"], package["version"]
-          request = urllib.request.Request(
-              f"https://crates.io/api/v1/crates/{name}/{version}",
-              headers={"User-Agent": f"{name}-publish ({package['repository']})"},
-          )
-          try:
-              with urllib.request.urlopen(request, timeout=30):
-                  published = True
-          except urllib.error.HTTPError as error:
-              if error.code != 404:
-                  raise
-              published = False
-          print(f"{name} {version}: {'already published; skipping' if published else 'ready to publish'}")
-          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write(f"publish={str(not published).lower()}\n")
-          PY
-
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
-        if: steps.version.outputs.publish == 'true'
         with:
           toolchain: 1.98.1
 
-      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
-        if: steps.version.outputs.publish == 'true'
+      - name: Check whether the crate version is published
+        id: version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | jq -r '.packages[0].version')
+          status=$(curl --silent --show-error --retry 3 --max-time 30 \
+            --user-agent 'stockfish-relay-ci (https://github.com/pragmaplatform/stockfish-relay)' \
+            --output /dev/null --write-out '%{http_code}' \
+            "https://crates.io/api/v1/crates/stockfish-relay/$version")
+          case "$status" in
+            200)
+              echo "stockfish-relay $version is already published; skipping."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::Failed to check crates.io for stockfish-relay $version (HTTP $status)."
+              exit 1
+              ;;
+          esac
 
       - name: Publish crate
         if: steps.version.outputs.publish == 'true'
