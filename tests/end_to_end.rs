@@ -743,6 +743,77 @@ async fn worker_reconnects_after_master_restart() {
 }
 
 #[tokio::test]
+async fn worker_logs_underlying_heartbeat_timeout() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = fixture(dir.path(), false);
+    let log_path = dir.path().join("worker.log");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}/", listener.local_addr().unwrap());
+    let worker_id = uuid::Uuid::new_v4();
+    let router = axum::Router::new()
+        .route(
+            "/v1/workers/register",
+            axum::routing::post(move || async move {
+                axum::Json(WorkerSession {
+                    worker_id,
+                    lease_ms: 1500,
+                    heartbeat_ms: 500,
+                    long_poll_ms: 1000,
+                    complete_and_claim: false,
+                })
+            }),
+        )
+        .route(
+            "/v1/workers/{id}/heartbeat",
+            axum::routing::post(std::future::pending::<StatusCode>),
+        )
+        .route(
+            "/v1/workers/{id}/claim",
+            axum::routing::post(std::future::pending::<StatusCode>),
+        );
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let mut worker = tokio::process::Command::new(env!("CARGO_BIN_EXE_stockfish-relay"))
+        .args([
+            "worker",
+            "--master",
+            &origin,
+            "--name",
+            "timeout-diagnostics",
+            "--concurrency",
+            "1",
+        ])
+        .arg("--stockfish-path")
+        .arg(engine)
+        .env("STOCKFISH_RELAY_WORKER_KEY", WORKER_KEY)
+        .env("RUST_LOG", "info")
+        .env("NO_COLOR", "1")
+        .stderr(std::fs::File::create(&log_path).unwrap())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let logs = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let logs = std::fs::read_to_string(&log_path).unwrap();
+            if logs.contains("Worker disconnected; reconnecting") {
+                break logs;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    worker.kill().await.unwrap();
+    server.abort();
+    let logs = logs.expect("a stalled heartbeat must produce a disconnect warning");
+    let warning = logs.lines().find(|line| line.contains("Worker disconnected;")).unwrap();
+    assert!(warning.contains("source: TimedOut"), "{warning}");
+    assert!(warning.contains("is_timeout=true"), "{warning}");
+    assert!(warning.contains("is_connect=false"), "{warning}");
+    assert!(warning.contains(&worker_id.to_string()), "{warning}");
+    assert!(warning.contains("/heartbeat"), "{warning}");
+    assert!(!logs.contains(WORKER_KEY), "worker credentials must not appear in logs");
+}
+
+#[tokio::test]
 async fn worker_reconnects_after_repeated_deployment_errors() {
     let dir = tempfile::tempdir().unwrap();
     let engine = fixture(dir.path(), false);

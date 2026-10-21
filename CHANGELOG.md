@@ -4,6 +4,14 @@ User-facing changes to Stockfish Relay, newest first. Historical entries are
 backfilled from Git history and grouped by package version in `Cargo.toml`;
 dates come from that history.
 
+## 0.3.6 - 2026-10-21
+
+### Changed
+
+- Include nested error details, timeout and connection-error flags, HTTP status,
+  worker ID, process uptime, session duration, and retry delay in worker reconnect
+  warnings. Log negotiated heartbeat, lease, and long-poll intervals on connection.
+
 ## 0.3.5 - 2026-10-13
 
 ### Changed
