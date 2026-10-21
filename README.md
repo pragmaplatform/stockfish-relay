@@ -289,27 +289,6 @@ journalctl -u stockfish-relay-worker -f
 The service runs at lower CPU priority than normal builds. Its thread/process
 limits still need to match the capacity you want to dedicate to analysis.
 
-## Publishing to crates.io
-
-After CI checks and package verification pass, pushes to `main` publish the
-version in `Cargo.toml` to [crates.io](https://crates.io/crates/stockfish-relay)
-using the repository's `CARGO_REGISTRY_TOKEN` Actions secret. The token must have
-permission to publish `stockfish-relay`.
-
-CI checks crates.io first and skips versions that are already published. Registry
-errors other than a missing version fail the job. Other branch pushes and tag
-pushes do not publish crates. Main-branch runs finish without being cancelled by newer
-pushes, so an upload can complete.
-
-To release a new crate version, update `Cargo.toml`, `Cargo.lock`, the changelog,
-and the current-version reference below, then merge to `main`. Crate versions are
-immutable; publishing changed code requires a new version. To validate locally
-without uploading:
-
-```bash
-cargo publish --dry-run --locked --registry crates-io
-```
-
 ## Container and Render
 
 GitHub Actions publishes the `linux/amd64` image to
